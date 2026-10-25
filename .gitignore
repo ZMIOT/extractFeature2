@@ -1,0 +1,27 @@
+# Source-only repository: explicitly include source and build inputs.
+/*
+!/.gitignore
+!/README.md
+!/CMakeLists.txt
+!/CMakePresets.json
+!/src/
+!/cmake/
+!/config/
+!/examples/
+!/tests/
+!/third_party/
+!/docs/
+/docs/*
+!/docs/SDK.md
+
+# Measured point clouds and generated artifacts remain local.
+/tests/data/
+*.pcd
+*.ply
+*.csv
+*.zip
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb

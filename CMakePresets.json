@@ -1,0 +1,102 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "vs2022-v142",
+      "displayName": "VS 2022 x64（v142，与 PCL 匹配）",
+      "description": "PCL/Boost 是 vc142，因此让 VS 2022 使用 v142 工具集。",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "toolset": "v142",
+      "binaryDir": "${sourceDir}/build/vs2022",
+      "environment": {
+        "PATH": "E:/environments/qt5/5.14.1/msvc2017_64/bin;E:/environments/PCL1.11.0/bin;E:/environments/PCL1.11.0/dll;E:/environments/PCL1.11.0/3rdParty/VTK/bin;E:/environments/PCL1.11.0/3rdParty/Boost/lib;E:/environments/PCL1.11.0/3rdParty/FLANN/bin;E:/environments/PCL1.11.0/3rdParty/Qhull/bin;E:/environments/PCL1.11.0/3rdParty/OpenNI2/Redist;$penv{PATH}",
+        "QT_PLUGIN_PATH": "E:/environments/qt5/5.14.1/msvc2017_64/plugins"
+      },
+      "cacheVariables": {
+        "CMAKE_CONFIGURATION_TYPES": "Debug;Release;RelWithDebInfo",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "/MD /Zi /Od /Ob0 /DNDEBUG",
+        "CMAKE_MAP_IMPORTED_CONFIG_RELWITHDEBINFO": "Release",
+        "PCL_DIR": "E:/environments/PCL1.11.0/cmake",
+        "Qt5_DIR": "E:/environments/qt5/5.14.1/msvc2017_64/lib/cmake/Qt5",
+        "Boost_COMPILER": "-vc142",
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/install",
+        "BUILD_TESTING": "OFF",
+        "WELD_SEAM_BUILD_APPS": "ON"
+      }
+    },
+    {
+      "name": "sdk",
+      "displayName": "纯点云算法库（无 Qt/VTK）",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "toolset": "v142",
+      "binaryDir": "${sourceDir}/build/sdk",
+      "environment": {
+        "PATH": "E:/environments/PCL1.11.0/bin;E:/environments/PCL1.11.0/dll;E:/environments/PCL1.11.0/3rdParty/FLANN/bin;E:/environments/PCL1.11.0/3rdParty/Boost/lib;$penv{PATH}"
+      },
+      "cacheVariables": {
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/install",
+        "CMAKE_DISABLE_FIND_PACKAGE_Qt5": "ON",
+        "WELD_SEAM_BUILD_APPS": "OFF",
+        "Boost_COMPILER": "-vc142",
+        "CMAKE_DISABLE_FIND_PACKAGE_VTK": "ON",
+        "PCL_DIR": "E:/environments/PCL1.11.0/cmake",
+        "BUILD_TESTING": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "relwithdebinfo",
+      "displayName": "源码调试（关闭优化，使用 Release 依赖）",
+      "configurePreset": "vs2022-v142",
+      "configuration": "RelWithDebInfo",
+      "jobs": 8
+    },
+    {
+      "name": "release",
+      "displayName": "构建 Release",
+      "configurePreset": "vs2022-v142",
+      "configuration": "Release",
+      "jobs": 8
+    },
+    {
+      "name": "debug",
+      "displayName": "构建 Debug",
+      "configurePreset": "vs2022-v142",
+      "configuration": "Debug",
+      "jobs": 8
+    },
+    {
+      "name": "sdk-release",
+      "configurePreset": "sdk",
+      "configuration": "Release",
+      "jobs": 8
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "release",
+      "displayName": "运行 Release 测试",
+      "configurePreset": "vs2022-v142",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "sdk-release",
+      "configurePreset": "sdk",
+      "configuration": "Release",
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

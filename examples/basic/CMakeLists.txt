@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.21)
+project(WeldSeamExample LANGUAGES CXX)
+find_package(WeldSeam 4 CONFIG REQUIRED)
+add_executable(weld_seam_example main.cpp)
+target_link_libraries(weld_seam_example PRIVATE WeldSeam::WeldSeam)
+if(MSVC)
+  target_compile_options(weld_seam_example PRIVATE /utf-8 /bigobj)
+endif()
