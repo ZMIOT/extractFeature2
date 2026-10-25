@@ -3,6 +3,7 @@
 #include <Eigen/Eigenvalues>
 #include <Eigen/SparseCholesky>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 
@@ -267,12 +268,18 @@ std::vector<ProfileCurvatureSample> fitParametricProfileSpline(
   std::vector<double> knots(count+4,length);
   for (int i=0;i<4;++i) knots[i]=0;
   for (int i=1;i<spans;++i) knots[i+3]=length*i/spans;
-  auto basis=[&](double parameter) {
+  Eigen::MatrixXd values=Eigen::MatrixXd::Zero(count,3);
+  int activeFirst=0,activeCount=0;
+  auto basis=[&](double parameter) -> const Eigen::MatrixXd& {
     const double s=std::max(0.0,std::min(length-1.e-9,parameter));
-    Eigen::MatrixXd values=Eigen::MatrixXd::Zero(count,3);
+    // Only the preceding span can contain nonzero values. Reuse the dense
+    // buffer so the final Eigen reductions retain their original order.
+    if(activeCount) values.middleRows(activeFirst,activeCount).setZero();
+    activeCount=0;
     const int span=int(std::upper_bound(knots.begin(),knots.end(),s)-knots.begin())-1;
     if (span<3 || span>=count) return values;
     const int first=span-3;
+    activeFirst=first;activeCount=4;
     // A cubic span has only four nonzero basis functions. Retain the same
     // recurrence and dense result/reduction order, but omit all zero branches.
     // Two extra zero columns support the derivative expressions at the edge.
@@ -294,35 +301,79 @@ std::vector<ProfileCurvatureSample> fitParametricProfileSpline(
     }
     return values;
   };
-  std::vector<std::vector<std::pair<int,double>>> rows(points.size());
+  struct BasisRow {
+    std::array<std::pair<int,double>,4> entries;
+    int size=0;
+    const std::pair<int,double>* begin() const {return entries.data();}
+    const std::pair<int,double>* end() const {return entries.data()+size;}
+  };
+  std::vector<BasisRow> rows(points.size());
   for (std::size_t i=0;i<points.size();++i) {
-    const auto b=basis(arc[i]);
-    for (int j=0;j<count;++j) if (b(j,0)>0) rows[i].emplace_back(j,b(j,0));
+    const auto &b=basis(arc[i]);
+    for (int j=activeFirst;j<activeFirst+activeCount;++j)
+      if (b(j,0)>0) rows[i].entries[rows[i].size++]={j,b(j,0)};
   }
   const Eigen::Vector2d origin=points.front().cast<double>();
+  std::vector<double> influence(points.size());
+  std::vector<Eigen::RowVector2d,Eigen::aligned_allocator<Eigen::RowVector2d>> observations(points.size());
+  for (std::size_t i=0;i<points.size();++i) {
+    // These terms are independent of the robust weights in all three passes.
+    const double support=i==0 ? arc[1]-arc[0] : i+1==points.size() ? arc[i]-arc[i-1] : .5*(arc[i+1]-arc[i-1]);
+    influence[i]=std::max(.05,std::min(4.0,support/(length/(points.size()-1))));
+    observations[i]=(points[i].cast<double>()-origin).transpose();
+  }
   std::vector<double> weights(points.size(),1);
   Eigen::MatrixXd controls;
+  Eigen::MatrixXd rhs(count,2);
+  std::vector<Eigen::Triplet<double>> entries;
+  entries.reserve(16*points.size()+9*std::size_t(count-2)+count);
+  Eigen::SparseMatrix<double> normal(count,count);
+  Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+  // Map the original triplet sequence to compressed coefficients once. A
+  // negative slot marks its first contribution (assignment, then additions),
+  // preserving setFromTriplets' duplicate summation order, including signed zero.
+  std::vector<int> entrySlots;
   double rms=0;
   for (int pass=0;pass<3;++pass) {
-    std::vector<Eigen::Triplet<double>> entries;
-    Eigen::MatrixXd rhs=Eigen::MatrixXd::Zero(count,2);
+    rhs.setZero();
+    std::size_t entryIndex=0;
+    auto addEntry=[&](int row,int column,double value) {
+      if(pass==0) entries.emplace_back(row,column,value);
+      else {
+        const int slot=entrySlots[entryIndex++];
+        if(slot<0) normal.valuePtr()[-slot-1]=value;
+        else normal.valuePtr()[slot]+=value;
+      }
+    };
     for (std::size_t i=0;i<points.size();++i) {
       // Equal arc-length influence rather than letting the dense floor dominate.
-      const double support=i==0 ? arc[1]-arc[0] : i+1==points.size() ? arc[i]-arc[i-1] : .5*(arc[i+1]-arc[i-1]);
-      const double w=weights[i]*std::max(.05,std::min(4.0,support/(length/(points.size()-1))));
-      const Eigen::RowVector2d observed=(points[i].cast<double>()-origin).transpose();
+      const double w=weights[i]*influence[i];
+      const auto &observed=observations[i];
       for (const auto &a:rows[i]) {
         rhs.row(a.first)+=w*a.second*observed;
-        for (const auto &b:rows[i]) entries.emplace_back(a.first,b.first,w*a.second*b.second);
+        for (const auto &b:rows[i]) addEntry(a.first,b.first,w*a.second*b.second);
       }
     }
     const double d[3]={1,-2,1};
     for (int i=1;i+1<count;++i) for (int a=0;a<3;++a) for (int b=0;b<3;++b)
-      entries.emplace_back(i+a-1,i+b-1,.15*d[a]*d[b]);
-    for (int i=0;i<count;++i) entries.emplace_back(i,i,1.e-10);
-    Eigen::SparseMatrix<double> normal(count,count);
-    normal.setFromTriplets(entries.begin(),entries.end());
-    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver(normal);
+      addEntry(i+a-1,i+b-1,.15*d[a]*d[b]);
+    for (int i=0;i<count;++i) addEntry(i,i,1.e-10);
+    if(pass==0) {
+      normal.setFromTriplets(entries.begin(),entries.end());
+      entrySlots.reserve(entries.size());
+      std::vector<bool> seen(normal.nonZeros(),false);
+      for(const auto &entry:entries) {
+        const int begin=normal.outerIndexPtr()[entry.col()];
+        const int end=normal.outerIndexPtr()[entry.col()+1];
+        const int slot=int(std::lower_bound(normal.innerIndexPtr()+begin,
+            normal.innerIndexPtr()+end,entry.row())-normal.innerIndexPtr());
+        entrySlots.push_back(seen[slot] ? slot : -slot-1);
+        seen[slot]=true;
+      }
+      solver.analyzePattern(normal);
+      if (solver.info()!=Eigen::Success) return {};
+    }
+    solver.factorize(normal);
     if (solver.info()!=Eigen::Success) return {};
     controls=solver.solve(rhs);
     if (solver.info()!=Eigen::Success || !controls.allFinite()) return {};
@@ -337,7 +388,7 @@ std::vector<ProfileCurvatureSample> fitParametricProfileSpline(
     rms=std::sqrt(rms/points.size());
   }
   for (double s=0;s<=length;s+=sampleStep) {
-    const auto b=basis(s);
+    const auto &b=basis(s);
     const Eigen::Vector2d point=origin+controls.transpose()*b.col(0);
     const Eigen::Vector2d velocity=controls.transpose()*b.col(1), acceleration=controls.transpose()*b.col(2);
     const double speed=velocity.norm();
