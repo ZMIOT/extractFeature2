@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
         << "  --floor-patch-size 6  --floor-patch-guard 0.6  "
            "--floor-max-correction 5\n"
         << "  --voxel-size 0.8  --profile-bin 1.2  --floor-patch-rms 0.4\n"
-        << "  --input-voxel 0.1 (measured input sampling, 0 disables)\n"
+        << "  --input-voxel 0.5 (measured input sampling, default 0.5, 0 disables)\n"
         << "  --profile-mode legacy-rolling|stable-grid  "
            "--profile-reference-scale 1.2\n"
         << "  --min-separation N (default: curve-line 8, curvature 6)  --no-floor-constraint\n"
