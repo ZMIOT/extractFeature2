@@ -233,6 +233,22 @@ HullSurfacesResult extractHullSurfaces(const CloudT::ConstPtr &input,
   // The chart must reach seeds on both banks of a normal-support gap;
   // its convex support boundary, not the search sphere, controls acceptance.
   const float patchRadius=18*grid;
+  // Both acceptance paths require an anchor within one of these squared
+  // distances. Outside the expanded anchor box neither path can retain a point.
+  PointT anchorMinimum,anchorMaximum;
+  pcl::getMinMax3D(*anchors,anchorMinimum,anchorMaximum);
+  Eigen::Vector3d supportMinimum=toVector(anchorMinimum).cast<double>();
+  Eigen::Vector3d supportMaximum=toVector(anchorMaximum).cast<double>();
+  const double supportRadius=std::sqrt(double(std::max(4.f*grid*grid,patchRadius*patchRadius)));
+  for(int dimension=0;dimension<3;++dimension) {
+    // Expand in double, with a conservative float-rounding margin for the
+    // KD-tree distance calculation. Borderline points still take the exact path.
+    const double scale=std::max({1.,std::abs(supportMinimum[dimension]),
+                                std::abs(supportMaximum[dimension]),supportRadius});
+    const double margin=16.*std::numeric_limits<float>::epsilon()*scale;
+    supportMinimum[dimension]-=supportRadius+margin;
+    supportMaximum[dimension]+=supportRadius+margin;
+  }
   const float preservationDistance=std::max(config.hullSurfaceDistance,config.hullPreservationMargin);
   auto patches=buildPatches(anchors,anchorIds,normals,selected,anchorTree,patchRadius,config.hullSurfaceDistance,check);
   // Long floor strips may have no accepted seeds at all. Fit candidate charts
@@ -249,6 +265,9 @@ HullSurfacesResult extractHullSurfaces(const CloudT::ConstPtr &input,
   std::vector<int> patchIds;std::vector<float> patchDistances;
   for(std::size_t i=0;i<input->size();++i) {
     if((i&1023u)==0)check();const auto &p=(*input)[i];if(!pcl::isFinite(p))continue;
+    if(p.x<supportMinimum.x() || p.x>supportMaximum.x() ||
+       p.y<supportMinimum.y() || p.y>supportMaximum.y() ||
+       p.z<supportMinimum.z() || p.z>supportMaximum.z())continue;
     anchorTree.nearestKSearch(p,1,ids,distances);
     if(ids.empty())continue;
     const int j=anchorIds[ids[0]];
