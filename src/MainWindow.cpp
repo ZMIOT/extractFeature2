@@ -53,11 +53,11 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
       appendLog(QStringLiteral("本地配置无效，使用内置默认值：") + QString::fromUtf8(error.c_str()));
     }
   }
-  connect(&watcher_, &QFutureWatcher<SeamResult>::finished, this,
+  connect(&watcher_, &QFutureWatcher<DetectionRun>::finished, this,
           [this] { finishDetection(watcher_.result()); });
 }
-void MainWindow::finishDetection(const SeamResult &result) {
-  result_ = result;
+void MainWindow::finishDetection(const DetectionRun &run) {
+  result_ = run.result;
   busy_ = false;
   parameters_->setEnabled(true);
   updateInputMode();
@@ -107,6 +107,18 @@ void MainWindow::finishDetection(const SeamResult &result) {
       result_.ok() ? QStringLiteral("提取完成：蓝色左侧面、橙色右侧面、绿色焊道面；可在“结果显示”中分别开关。")
                    : QStringLiteral("提取失败，请检查日志与参数。"));
   refreshView(true);
+  // Complete rendering before stopping the click-to-display timer.
+  vtkWidget_->GetRenderWindow()->Render();
+  const double totalMilliseconds = runTimer_.nsecsElapsed() / 1.e6;
+  appendLog(QStringLiteral("算法时间：%1 s（%2 ms，含入口降采样和完整提取流程）")
+                .arg(run.algorithmMilliseconds / 1000., 0, 'f', 3)
+                .arg(run.algorithmMilliseconds, 0, 'f', 1));
+  appendLog(QStringLiteral("总时间：%1 s（%2 ms，点击提取至结果显示更新；不含文件加载和保存）")
+                .arg(totalMilliseconds / 1000., 0, 'f', 3)
+                .arg(totalMilliseconds, 0, 'f', 1));
+  if (resultConfig_.debugFlag)
+    appendLog(QStringLiteral("当前为逐步调试模式：上述时间包含调试窗口显示及等待操作的时间。"));
+  runTimer_.invalidate();
   emit extractionFinished(result_.ok());
 }
 void MainWindow::setDebugFlag(bool enabled) {
@@ -940,6 +952,7 @@ bool MainWindow::loadPath(const QString &path) {
 void MainWindow::runDetection() {
   if (busy_ || cloud_->empty())
     return;
+  runTimer_.start();
   resultConfig_ = currentConfig();
   result_ = SeamResult();
   busy_ = true;
@@ -966,31 +979,35 @@ void MainWindow::runDetection() {
   if (config.debugFlag) {
     // VTK 和模态步骤窗口只在主线程创建；调试模式逐步等待用户继续。
     QTimer::singleShot(0, this, [this, input, config, frames] {
-      SeamResult result;
+      DetectionRun run;
+      QElapsedTimer algorithmTimer;
+      algorithmTimer.start();
       try {
-        result = detectWithDebugViewer(input, config, this, frames);
+        run.result = detectWithDebugViewer(input, config, this, frames);
       } catch (const std::exception &e) {
-        result.summary = e.what();
+        run.result.summary = e.what();
       } catch (...) {
-        result.summary = "Unexpected algorithm failure";
+        run.result.summary = "Unexpected algorithm failure";
       }
-      finishDetection(result);
+      run.algorithmMilliseconds = algorithmTimer.nsecsElapsed() / 1.e6;
+      finishDetection(run);
     });
     return;
   }
   watcher_.setFuture(QtConcurrent::run([input, config, frames] {
+    DetectionRun run;
+    QElapsedTimer algorithmTimer;
+    algorithmTimer.start();
     try {
-      return SeamDetector().detect(input, config, nullptr, nullptr, nullptr,
-                                   &frames);
+      run.result = SeamDetector().detect(input, config, nullptr, nullptr, nullptr,
+                                         &frames);
     } catch (const std::exception &e) {
-      SeamResult r;
-      r.summary = e.what();
-      return r;
+      run.result.summary = e.what();
     } catch (...) {
-      SeamResult r;
-      r.summary = "Unexpected algorithm failure";
-      return r;
+      run.result.summary = "Unexpected algorithm failure";
     }
+    run.algorithmMilliseconds = algorithmTimer.nsecsElapsed() / 1.e6;
+    return run;
   }));
 }
 void MainWindow::saveResult() {

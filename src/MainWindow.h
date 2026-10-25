@@ -1,6 +1,7 @@
 #pragma once
 #include "SeamTypes.h"
 #include "AlgorithmParameters.h"
+#include <QElapsedTimer>
 #include <QFutureWatcher>
 #include <QMainWindow>
 #include <pcl/visualization/pcl_visualizer.h>
@@ -28,7 +29,11 @@ signals:
   void extractionFinished(bool ok);
 
 private:
-  void finishDetection(const SeamResult &result);
+  struct DetectionRun {
+    SeamResult result;
+    double algorithmMilliseconds = 0;
+  };
+  void finishDetection(const DetectionRun &run);
   void updateInputMode();
   void updateDebugSliceRange();
   void updateRefinementControls();
@@ -107,7 +112,8 @@ private:
   AlgorithmParameters algorithmParameters_;
   ProfileLocalizationMethod activeAlgorithm_ = ProfileLocalizationMethod::CurvatureCandidates;
   QString inputPath_;
-  QFutureWatcher<SeamResult> watcher_;
+  QFutureWatcher<DetectionRun> watcher_;
+  QElapsedTimer runTimer_;
   bool busy_ = false, settingDefaults_ = false;
 };
 } // namespace weld
