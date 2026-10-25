@@ -44,6 +44,7 @@ int main(int argc, char **argv) {
         << "  --floor-patch-size 6  --floor-patch-guard 0.6  "
            "--floor-max-correction 5\n"
         << "  --voxel-size 0.8  --profile-bin 1.2  --floor-patch-rms 0.4\n"
+        << "  --input-voxel 0.1 (measured input sampling, 0 disables)\n"
         << "  --profile-mode legacy-rolling|stable-grid  "
            "--profile-reference-scale 1.2\n"
         << "  --min-separation N (default: curve-line 8, curvature 6)  --no-floor-constraint\n"
@@ -148,6 +149,7 @@ int main(int argc, char **argv) {
       {"--floor-patch-guard", &config.floorPatchGuard},
       {"--floor-max-correction", &config.floorPatchMaxCorrection},
       {"--voxel-size", &config.voxelSize},
+      {"--input-voxel", &config.inputVoxelSize},
       {"--profile-bin", &config.profileBinSize},
       {"--profile-reference-scale", &config.profileReferenceScale},
       {"--floor-patch-rms", &config.floorPatchMaxRms},

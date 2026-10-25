@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(WeldSeamScheme1 VERSION 4.0.0 LANGUAGES CXX)
+project(WeldSeamScheme1 VERSION 5.0.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(WELD_SEAM_BUILD_APPS "Build local GUI/CLI tools (not installed with SDK)" OFF)
@@ -18,7 +18,7 @@ if(NOT PCL_FLANN_INCLUDE_DIR)
 endif()
 
 # Memory-in / memory-out library. No PCL io, Qt or VTK in this target.
-add_library(seam_core SHARED src/SeamDetector.cpp src/UniformSeamWidth.cpp
+add_library(seam_core SHARED src/SeamDetector.cpp src/UniformSeamWidth.cpp src/InputSampling.cpp
   src/ProfileCurvature.cpp src/HullSurfaces.cpp src/SeamSmoother.cpp
   src/SeamHistory.cpp src/ConfigIO.cpp src/WeldSeam.cpp src/SurfaceClouds.cpp src/BSplineSurface.cpp)
 set_target_properties(seam_core PROPERTIES OUTPUT_NAME WeldSeam EXPORT_NAME WeldSeam
@@ -88,6 +88,10 @@ if(BUILD_TESTING)
   target_link_libraries(profile_spline_test PRIVATE seam_core)
   add_test(NAME robust_profile_spline COMMAND profile_spline_test)
   list(APPEND _weld_targets profile_spline_test)
+  add_executable(input_sampling_test tests/test_input_sampling.cpp)
+  target_link_libraries(input_sampling_test PRIVATE seam_core)
+  add_test(NAME measured_input_sampling COMMAND input_sampling_test)
+  list(APPEND _weld_targets input_sampling_test)
   add_executable(seam_diagnostic tests/detect_diagnostic.cpp)
   target_link_libraries(seam_diagnostic PRIVATE seam_core seam_test_io)
   list(APPEND _weld_targets seam_test_io seam_detector_test config_io_test cloud_api_test surface_clouds_test seam_diagnostic)

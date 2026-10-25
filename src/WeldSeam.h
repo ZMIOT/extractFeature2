@@ -20,7 +20,7 @@ namespace weld {
  * 仅输出有效检测截面内有局部几何支撑的区域，缺失/不支持的面可能为空。
  * 左右以检测横向坐标增大方向定义（默认 Y 较小为左），与观察视角无关。
  * 三个新增 SurfaceModel 为分片三次 B 样条函数，须单独检查 valid()。
- * SDK 4 扩展了结构体布局；调用方必须与新版头文件、LIB、DLL 一起重新编译。
+ * SDK 5 扩展了参数与检测统计布局；调用方必须与新版头文件、LIB、DLL 一起重新编译。
  */
 struct SeamClouds {
   CloudT::Ptr left{new CloudT}; ///< 左焊缝 XYZ 点云。

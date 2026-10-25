@@ -4,9 +4,11 @@ WeldSeam 是一个 C++ 点云算法库，输入原始 XYZ 点云，返回左侧�
 
 调用时使用连续曲率算法的内置默认参数，无需读取或修改 JSON 配置文件。
 
-当前 SDK 版本为 **4.0.0**。新增 `leftSurfaceModel`、`weldSurfaceModel`、`rightSurfaceModel` 三个 B 样条曲面输出，可求坐标和法向。返回结构体布局发生变化，调用工程必须使用配套的新头文件、LIB 和 DLL 重新编译。用法、分片与有效范围见 [SDK 曲面说明](docs/SDK.md#b-样条曲面输出)。
+当前 SDK 版本为 **5.0.0**。新增入口实测点采样参数 `inputVoxelSize`，参数和检测统计结构体布局发生变化，调用工程必须使用配套的新头文件、LIB 和 DLL 重新编译。保留 `leftSurfaceModel`、`weldSurfaceModel`、`rightSurfaceModel` 三个 B 样条曲面输出，可求坐标和法向。用法、分片与有效范围见 [SDK 曲面说明](docs/SDK.md#b-样条曲面输出)。
 
-SDK 3.0 的浅槽端部面提取修复已包含在本版中。此前仅替换 DLL 的升级方式不适用于 SDK 4。GUI/CLI 导出增加 `*_left_surface_model.json`、`*_weld_surface_model.json`、`*_right_surface_model.json`，保存完整 B 样条函数。
+SDK 3.0 的浅槽端部面提取修复已包含在本版中。不能仅替换旧版 DLL 升级到 SDK 5。GUI/CLI 导出 `*_left_surface_model.json`、`*_weld_surface_model.json`、`*_right_surface_model.json`，保存完整 B 样条函数。
+
+`inputVoxelSize=0` 关闭入口采样，也是默认值。GUI 在“关键参数 → 入口降采样体素（0 关闭）”直接调整，支持三位小数，例如 `0.05`、`0.075`、`0.1`；单位与点云一致。每帧独立选择最靠近体素中心的原始测量点，保留每帧首尾点、原始坐标、帧号与点顺序，不生成体素均值点。主体提取、候选生成、局部精修及三个表面均使用采样后的点云；启用时跳过旧的 `voxelSize` 二次降采样。采样可能影响轨迹和曲面拟合，应对照未采样结果评估后选值。CLI 使用 `--input-voxel 0.075`，JSON 配置使用 `"inputVoxelSize": 0.075`；示例数值不代表已验证的精度保证。
 
 ## 交付目录
 
@@ -81,7 +83,7 @@ if (weld::extractSeams(input, output)) {
 在调用工程的 `CMakeLists.txt` 中，定义自己的目标后添加：
 
 ```cmake
-find_package(WeldSeam 4 CONFIG REQUIRED)
+find_package(WeldSeam 5 CONFIG REQUIRED)
 target_link_libraries(your_target PRIVATE WeldSeam::WeldSeam)
 ```
 

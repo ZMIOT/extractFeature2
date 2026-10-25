@@ -252,6 +252,8 @@ bool saveResults(const QString &outputPath, const SeamResult &r,
   metadata["endpointTrimmedEnd"] = int(r.endpointTrimmedEnd);
   metadata["candidateCorrectionRejected"] = int(r.candidateCorrectionRejected);
   metadata["rightPoints"] = int(r.rightSeam->size());
+  metadata["inputSamplingPoints"] = double(r.inputSamplingPoints);
+  metadata["inputSamplingRemovedPoints"] = double(r.inputSamplingRemovedPoints);
   auto fallbackCount = [](const std::vector<SeamPointQuality> &quality) {
     int count=0;
     for (const auto &q:quality) if (q.flags & QualityCurvatureFallback) ++count;

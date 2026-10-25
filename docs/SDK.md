@@ -4,9 +4,11 @@ WeldSeam 是一个 C++ 点云算法库，输入原始 XYZ 点云，返回左侧�
 
 调用时使用连续曲率算法的内置默认参数，无需读取或修改 JSON 配置文件。
 
-当前 SDK 版本为 **4.0.0**。新增左、中、右三个 B 样条曲面模型，返回结构体布局发生变化，调用工程必须使用配套的新头文件、LIB 和 DLL 重新编译。
+当前 SDK 版本为 **5.0.0**。新增入口采样参数 `inputVoxelSize` 和采样点数统计，参数和检测结果结构体布局发生变化，调用工程必须使用配套的新头文件、LIB 和 DLL 重新编译。保留左、中、右三个 B 样条曲面模型。
 
-SDK 3.0 的浅槽端部面提取修复已包含在本版中。此前仅替换 DLL 的升级方式不适用于 SDK 4。
+SDK 3.0 的浅槽端部面提取修复已包含在本版中。不能仅替换旧版 DLL 升级到 SDK 5。
+
+`config.inputVoxelSize=0` 关闭入口采样。可设置为 `0.1f` 试验小体素；单位与输入点云一致。提供 `frames` 时逐帧采样，保留帧号和每帧首尾点；每个体素选择最接近中心的实测点，输出仍为原始坐标。所有后续阶段使用同一份采样点云，启用时跳过旧 `voxelSize` 二次降采样。该参数不同于仅用于主体分析的 `hullSurfaceVoxelSize`；改变采样可能改变轨迹和曲面，需对照原始输入验证。
 
 ## 交付目录
 
@@ -108,7 +110,7 @@ if (weld::extractSeams(input, output)) {
 在调用工程的 `CMakeLists.txt` 中，定义自己的目标后添加：
 
 ```cmake
-find_package(WeldSeam 4 CONFIG REQUIRED)
+find_package(WeldSeam 5 CONFIG REQUIRED)
 target_link_libraries(your_target PRIVATE WeldSeam::WeldSeam)
 ```
 

@@ -304,6 +304,10 @@ void MainWindow::buildUi() {
   trimEndpoints_ = new QCheckBox(QStringLiteral("首尾大幅变动处截断"),parameters_);
   trimEndpoints_->setObjectName("trimUnstableEndpoints");
   trimEndpoints_->setToolTip(QStringLiteral("从稳定段向首尾检查方向变化和偏离量；连续异常达到确认长度时，去掉外侧尾段。两侧同步截断，保留中间真实弯曲。"));
+  inputVoxel_ = spin(0, 1, .025, QStringLiteral("0 关闭入口降采样；数值越大，通常保留的点越少。按原始帧保留实测代表点，所有后续算法阶段使用采样后的点云。单位与点云一致，调整后请对照轨迹效果。"));
+  inputVoxel_->setObjectName("inputVoxelSize");
+  inputVoxel_->setDecimals(3);
+  form->addRow(QStringLiteral("入口降采样体素（0 关闭）"), inputVoxel_);
   auto *advancedButton =
       new QPushButton(QStringLiteral("展开高级参数"), parameters_);
   advancedButton->setObjectName("advancedParametersButton");
@@ -733,6 +737,7 @@ void MainWindow::applyConfig(const DetectorConfig &c) {
   floorGuard_->setValue(c.floorPatchGuard);
   maxCorrection_->setValue(c.floorPatchMaxCorrection);
   voxel_->setValue(c.voxelSize);
+  inputVoxel_->setValue(c.inputVoxelSize);
   bin_->setValue(c.profileBinSize);
   profileMode_->setCurrentIndex(
       c.profileSamplingMode == ProfileSamplingMode::StableGrid ? 1 : 0);
@@ -824,6 +829,7 @@ DetectorConfig MainWindow::currentConfig() const {
   c.floorPatchGuard = float(floorGuard_->value());
   c.floorPatchMaxCorrection = float(maxCorrection_->value());
   c.voxelSize = float(voxel_->value());
+  c.inputVoxelSize = float(inputVoxel_->value());
   c.profileBinSize = float(bin_->value());
   c.profileSamplingMode = profileMode_->currentIndex() == 1
                               ? ProfileSamplingMode::StableGrid

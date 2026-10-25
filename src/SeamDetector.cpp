@@ -4,11 +4,12 @@
  * 目标：从槽形点云中输出左右两条焊缝，并使可靠点同时位于局部底面和侧壁。
  * 坐标：A 为 longitudinalAxis；U/V 是 transverseAxes(A) 返回的两个截面轴。
  *       L 是 U 较小的一侧，R 是 U 较大的一侧，与屏幕左右、全局上下无关。
- * 数据：filteredCloud 用于搜索结构；局部侧壁/底面精修重新读取原始 input。
+ * 数据：入口采样保留实测点；后续主体、候选、精修和面提取共用采样点云。
+ *       filteredCloud 用于搜索结构；局部侧壁/底面精修读取采样后的实测源点。
  *       不能把降采样中值点当作最后的实测平面支持，否则会再次产生偏移。
  *
  * 主流程索引（在编辑器中搜索对应 S 编号；文档使用相同编号）：
- * S00 输入检查 -> H 船体主体提取 -> S01 有限点 -> S02 离群滤波 -> S03 体素降采样
+ * S00 输入检查/逐帧入口采样 -> H 船体主体提取 -> S01 有限点 -> S02 离群滤波 -> S03 体素降采样
  * 主体保护模式跳过二次滤波；debugFrameBatchSize>0 时只在 H、帧组 F 和最终结果暂停。
  * -> S04 纵向切片 -> S05 截面分箱 -> S06 三面结构候选 -> S07 局部折角
  * -> S08 保留主体 -> S09 成对路径优化 -> S10 内部短缺口插补
@@ -29,6 +30,7 @@
 #include "ProfileCurvature.h"
 #include "HullSurfaces.h"
 #include "SurfaceClouds.h"
+#include "InputSampling.h"
 
 #include <pcl/common/common.h>
 #include <pcl/common/point_tests.h>
@@ -5342,23 +5344,37 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
         return result;
       }
   }
-  CloudT::ConstPtr sourceInput = input;
   finishStage("validation");
+  const auto sampled=sampleMeasuredInput(input,config.inputVoxelSize,frames);
+  if(!sampled.error.empty()) {result.summary=sampled.error;return result;}
+  const auto &detectionInput=sampled.cloud;
+  const auto *detectionFrames=frameBased ? &sampled.frames : nullptr;
+  CloudT::ConstPtr sourceInput = detectionInput;
+  result.inputSamplingPoints=detectionInput->size();
+  result.inputSamplingRemovedPoints=input->size()-detectionInput->size();
+  if(config.inputVoxelSize>0) {
+    // Avoid a second, centroid-generating voxel pass on the sampled cloud.
+    workingConfig.voxelSize=0;
+    publishDebugStep(debug,"S00 入口实测点降采样",{{"采样后点云",detectionInput}},
+        "逐帧保留实测点，主体、候选和表面提取共用此点云。",
+        {{"input_points",double(input->size())},{"sampled_points",double(detectionInput->size())}});
+  }
+  finishStage("input_sampling");
   std::vector<ScanFrameRange> bodyFrames;
   if (config.extractMainBody) {
-    const auto body = extractHullSurfaces(input, config);
+    const auto body = extractHullSurfaces(detectionInput, config);
     if (!body.ok()) {
       result.summary = "Main body extraction failed: " + body.error;
-      publishDebugStep(debug, "H 主体提取失败", {{"输入点云", input}}, result.summary);
+      publishDebugStep(debug, "H 主体提取失败", {{"输入点云", detectionInput}}, result.summary);
       return result;
     }
     result.mainBodyCloud = body.cloud;
     result.filteredCloud = body.cloud;
-    result.removedBodyPoints = input->size() - body.cloud->size();
+    result.removedBodyPoints = detectionInput->size() - body.cloud->size();
     sourceInput = body.cloud;
     if (frameBased) {
       std::size_t retained = 0;
-      for (const auto &frame : *frames) {
+      for (const auto &frame : *detectionFrames) {
         const auto begin = retained;
         while (retained < body.sourceIndices.size() &&
                body.sourceIndices[retained] < frame.begin + frame.count)
@@ -5370,10 +5386,10 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
     if (stepDebugEnabled(debug)) {
       CloudT::Ptr rejected(new CloudT);
       std::size_t retained = 0;
-      for (std::size_t i = 0; i < input->size(); ++i) {
+      for (std::size_t i = 0; i < detectionInput->size(); ++i) {
         if (retained < body.sourceIndices.size() && body.sourceIndices[retained] == i)
           ++retained;
-        else if (pcl::isFinite((*input)[i])) rejected->push_back((*input)[i]);
+        else if (pcl::isFinite((*detectionInput)[i])) rejected->push_back((*detectionInput)[i]);
       }
       publishDebugStep(debug, "H 第一步 · 船体主要轮廓",
           {{"剔除点", rejected}, {"船体主体原始点", body.cloud}},
@@ -5395,7 +5411,7 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
   if (frameBased) {
     CloudT::Ptr flattened;
     float frameStep = 1.0f;
-    if (!prepareFrameSections(sourceInput, config.extractMainBody ? bodyFrames : *frames,
+    if (!prepareFrameSections(sourceInput, config.extractMainBody ? bodyFrames : *detectionFrames,
                               workingConfig, flattened, measuredFrames,
                               processedFrames, frameProjections, frameStep,
                               result.summary))
@@ -5407,9 +5423,9 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
     workingInput = flattened;
     result.filteredCloud = flattened;
     if (debug) {
-      debug->clouds.push_back({"01_original_frames", input});
+      debug->clouds.push_back({"01_original_frames", detectionInput});
       publishDebugStep(debug, "S01 保留原始帧点",
-                       {{"原始帧点云", input}},
+                       {{"原始帧点云", detectionInput}},
                        "帧号定义截面，预处理不会混合不同帧。");
       publishDebugStep(debug, "S02 截面来源：原始帧",
                        {{"逐帧预处理点云", flattened}});
@@ -5588,7 +5604,7 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
     surfaceSections.push_back(section);
   }
   extractSurfaceClouds(sourceInput,surfaceSections,workingConfig,result,
-      frameBased ? (config.extractMainBody ? &bodyFrames : frames) : nullptr);
+      frameBased ? (config.extractMainBody ? &bodyFrames : detectionFrames) : nullptr);
   finishStage("surface_extraction");
   if(config.uniformWidthEnabled) {
     std::vector<UniformWidthSection> sections(leftPath.size());
@@ -5632,6 +5648,10 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
   if (config.extractMainBody)
     result.summary += " Main body: " + std::to_string(result.mainBodyCloud->size()) +
                       " original points retained, " + std::to_string(result.removedBodyPoints) + " removed.";
+  if(config.inputVoxelSize>0)
+    result.summary += " Input sampling: voxel="+std::to_string(config.inputVoxelSize)+
+        ", retained="+std::to_string(result.inputSamplingPoints)+
+        ", removed="+std::to_string(result.inputSamplingRemovedPoints)+" measured points.";
   result.summary += " Excessive candidate corrections rejected: " + std::to_string(result.candidateCorrectionRejected) + ".";
   if (frameBased)
     result.summary += " Original-frame input: " +

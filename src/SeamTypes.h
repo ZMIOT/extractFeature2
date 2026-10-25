@@ -159,6 +159,8 @@ struct DetectorConfig {
   // 所有长度参数都使用点云自身单位；当前样例数据按毫米设置默认值。
   /** @brief 预处理体素边长（长度）；0 禁用体素降采样。 @details 默认 0.8f；有效范围 0..1000000000。 */
   float voxelSize = 0.8f;
+  /** @brief 算法入口的实测点体素采样；0 关闭。逐帧采样，所有后续阶段共用采样点云。 */
+  float inputVoxelSize = 0.0f;
   /** @brief 统计离群滤波邻居数（点）；0 禁用。 @details 默认 12；有效范围 0..100000。 */
   int outlierMeanK = 12;
   /** @brief 离群标准差倍数。 @details 默认 2.0f；有效范围 0..1000000000。 */
@@ -485,6 +487,8 @@ struct SeamResult {
   BSplineSurfaceModel leftSurfaceModel, weldSurfaceModel, rightSurfaceModel;
   /// @brief 主体提取移除的输入点数。
   std::size_t removedBodyPoints = 0;
+  /// @brief 入口采样后的点数，以及入口采样移除的点数（不含主体剔除）。
+  std::size_t inputSamplingPoints = 0, inputSamplingRemovedPoints = 0;
   /// @brief true 表示按输入原始帧检测，false 表示空间切片。
   bool frameBased = false;
   /// @brief 输入原始帧总数；空间切片模式为 0。

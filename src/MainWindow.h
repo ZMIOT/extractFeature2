@@ -48,7 +48,7 @@ private:
   QComboBox *axis_ = nullptr, *profileMode_ = nullptr;
   QDoubleSpinBox *step_ = nullptr, *thickness_ = nullptr, *floorSize_ = nullptr,
                  *floorGuard_ = nullptr, *maxCorrection_ = nullptr;
-  QDoubleSpinBox *voxel_ = nullptr, *bin_ = nullptr,
+  QDoubleSpinBox *inputVoxel_ = nullptr, *voxel_ = nullptr, *bin_ = nullptr,
                  *profileReferenceScale_ = nullptr, *floorRms_ = nullptr,
                  *separation_ = nullptr;
   QCheckBox *surfaceEnabled_ = nullptr, *floorEnabled_ = nullptr,
