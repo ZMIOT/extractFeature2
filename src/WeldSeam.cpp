@@ -10,12 +10,19 @@ DetectorConfig defaultDetectorConfig() {
 bool extractSeams(const CloudT::ConstPtr &input, SeamClouds &output,
                   const DetectorConfig &config, std::string *error,
                   const std::vector<ScanFrameRange> *frames) {
+  return extractSeams(input, output, true, config, error, frames);
+}
+bool extractSeams(const CloudT::ConstPtr &input, SeamClouds &output,
+                  bool generateSurfaceModels, const DetectorConfig &config,
+                  std::string *error,
+                  const std::vector<ScanFrameRange> *frames) {
   // Do not mutate pointed-to clouds: an output from an earlier call may also
   // be the input to this call. Read it completely before replacing output.
   std::string detail;
   if (validateDetectorConfig(config, &detail)) {
     try {
-      const auto result = SeamDetector().detect(input, config, nullptr, nullptr, nullptr, frames);
+      const auto result = SeamDetector().detect(input, config, nullptr, nullptr, nullptr, frames,
+                                                generateSurfaceModels);
       if (result.ok()) {
         output.left = result.leftSeam;
         output.right = result.rightSeam;

@@ -113,7 +113,8 @@ SidePlane fitToePatch(const CloudT &profile, const std::vector<bool> &supported,
 void extractSurfaceClouds(const CloudT::ConstPtr &source,
                           const std::vector<SurfaceSection> &sections,
                           const DetectorConfig &config, SeamResult &result,
-                          const std::vector<ScanFrameRange> *frames) {
+                          const std::vector<ScanFrameRange> *frames,
+                          bool generateSurfaceModels) {
   result.leftSurface.reset(new CloudT);
   result.rightSurface.reset(new CloudT);
   result.weldSurface.reset(new CloudT);
@@ -306,8 +307,10 @@ void extractSurfaceClouds(const CloudT::ConstPtr &source,
     else if (labels[i]==2) result.rightSurface->push_back((*source)[i]);
     else if (labels[i]==3) result.weldSurface->push_back((*source)[i]);
   }
-  result.leftSurfaceModel=fitSurfaceModel(*source,groups,sections,labels,1,config);
-  result.weldSurfaceModel=fitSurfaceModel(*source,groups,sections,labels,3,config);
-  result.rightSurfaceModel=fitSurfaceModel(*source,groups,sections,labels,2,config);
+  if (generateSurfaceModels) {
+    result.leftSurfaceModel=fitSurfaceModel(*source,groups,sections,labels,1,config);
+    result.weldSurfaceModel=fitSurfaceModel(*source,groups,sections,labels,3,config);
+    result.rightSurfaceModel=fitSurfaceModel(*source,groups,sections,labels,2,config);
+  }
 }
 }

@@ -62,6 +62,7 @@ private:
             *showWeldSurface_ = nullptr, *showTracks_ = nullptr,
             *showBody_ = nullptr;
   QCheckBox *trimEndpoints_ = nullptr;
+  QCheckBox *generateSurfaceModels_ = nullptr;
   QDoubleSpinBox *minimumFeatureDepth_ = nullptr;
   QDoubleSpinBox *endpointAngle_ = nullptr, *endpointWindow_ = nullptr, *endpointDeviation_ = nullptr;
   QCheckBox *finalSmoothing_ = nullptr;
@@ -115,5 +116,6 @@ private:
   QFutureWatcher<DetectionRun> watcher_;
   QElapsedTimer runTimer_;
   bool busy_ = false, settingDefaults_ = false;
+  bool resultGenerateSurfaceModels_ = true;
 };
 } // namespace weld

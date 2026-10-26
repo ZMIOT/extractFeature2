@@ -57,4 +57,17 @@ bool extractSeams(const CloudT::ConstPtr &input, SeamClouds &output,
                   const DetectorConfig &config = defaultDetectorConfig(),
                   std::string *error = nullptr,
                   const std::vector<ScanFrameRange> *frames = nullptr);
+
+/**
+ * @brief 从输入点云提取焊缝轨迹和三个面的实测点云，可选择是否拟合曲面模型。
+ * @param[in] generateSurfaceModels false（或 0）时跳过三个 B 样条曲面模型的拟合，
+ * 仅生成轨迹和实测面点云；true（或 1）时同时生成曲面模型。
+ * @details 其余参数和返回约定与不带此开关的 extractSeams 重载相同。
+ * 跳过拟合时三个 SurfaceModel 保持默认的 not_fitted 状态。
+ */
+bool extractSeams(const CloudT::ConstPtr &input, SeamClouds &output,
+                  bool generateSurfaceModels,
+                  const DetectorConfig &config = defaultDetectorConfig(),
+                  std::string *error = nullptr,
+                  const std::vector<ScanFrameRange> *frames = nullptr);
 } // namespace weld

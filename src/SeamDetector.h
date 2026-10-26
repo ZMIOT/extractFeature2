@@ -18,6 +18,7 @@ public:
    * @param[in,out] debug 可空；重置并填充过程信息，保留 onStep 回调；回调在调用线程同步执行。
    * @param[in] frames 可空/空数组表示空间切片；否则范围必须连续覆盖 input，count>0，
    * 帧号非负且严格递增。原始帧模式忽略 sliceStep/sliceThickness。
+   * @param[in] generateSurfaceModels false 时保留三个实测面点云但跳过 B 样条曲面拟合。
    * @return 包含 XYZ 轨迹、三个面实测点云、置信度、质量标志、分段边界及耗时的 SeamResult。
    * 先检查 ok()；失败或未检测到焊缝时读取 summary，不使用空轨迹。
    * @note 输出坐标恢复到原始点云坐标系；不得跨 segmentStarts 的边界连线。
@@ -28,7 +29,8 @@ public:
                     const SeamHistory *leftHistory = nullptr,
                     const SeamHistory *rightHistory = nullptr,
                     DebugTrace *debug = nullptr,
-                    const std::vector<ScanFrameRange> *frames = nullptr) const;
+                    const std::vector<ScanFrameRange> *frames = nullptr,
+                    bool generateSurfaceModels = true) const;
 
 private:
   static CloudT::Ptr preprocess(const CloudT::ConstPtr &input,

@@ -60,6 +60,7 @@ void MainWindow::finishDetection(const DetectionRun &run) {
   result_ = run.result;
   busy_ = false;
   parameters_->setEnabled(true);
+  generateSurfaceModels_->setEnabled(true);
   updateInputMode();
   defaults_->setEnabled(true);
   load_->setEnabled(true);
@@ -80,9 +81,10 @@ void MainWindow::finishDetection(const DetectionRun &run) {
         .arg(result_.weldSurface->size());
     resultLabel_->setText(resultLabel_->text()+"\n"+faces);
     appendLog(faces);
-    const auto models=QStringLiteral("B 样条曲面片：左 %1 · 中 %2 · 右 %3")
+    const auto models=resultGenerateSurfaceModels_ ? QStringLiteral("B 样条曲面片：左 %1 · 中 %2 · 右 %3")
         .arg(result_.leftSurfaceModel.patches.size()).arg(result_.weldSurfaceModel.patches.size())
-        .arg(result_.rightSurfaceModel.patches.size());
+        .arg(result_.rightSurfaceModel.patches.size())
+        : QStringLiteral("曲面模型拟合已关闭：仅生成轨迹和面点云");
     resultLabel_->setText(resultLabel_->text()+"\n"+models);appendLog(models);
     if(result_.leftSurface->empty() || result_.rightSurface->empty() || result_.weldSurface->empty())
       appendLog(QStringLiteral("部分面缺少有效实测支撑，未输出的面为空。"));
@@ -590,6 +592,12 @@ void MainWindow::buildUi() {
                           static_cast<QWidget *>(save_),static_cast<QWidget *>(resultLabel_)})
     column->removeWidget(action);
   controlsLayout->addWidget(defaults_);
+  generateSurfaceModels_ = new QCheckBox(QStringLiteral("生成拟合曲面模型"), controls);
+  generateSurfaceModels_->setObjectName("generateSurfaceModels");
+  generateSurfaceModels_->setChecked(true);
+  generateSurfaceModels_->setToolTip(QStringLiteral("勾选时生成左侧、焊道、右侧 B 样条曲面模型；取消勾选可跳过曲面拟合，仅输出轨迹和实测面点云。修改后需重新提取。此输出选项对两种算法共用。"));
+  connect(generateSurfaceModels_, &QCheckBox::toggled, this, [this] { invalidateResult(); });
+  controlsLayout->addWidget(generateSurfaceModels_);
   auto *actions = new QHBoxLayout;
   actions->addWidget(run_,1);
   actions->addWidget(save_,1);
@@ -954,9 +962,11 @@ void MainWindow::runDetection() {
     return;
   runTimer_.start();
   resultConfig_ = currentConfig();
+  resultGenerateSurfaceModels_ = generateSurfaceModels_->isChecked();
   result_ = SeamResult();
   busy_ = true;
   parameters_->setEnabled(false);
+  generateSurfaceModels_->setEnabled(false);
   defaults_->setEnabled(false);
   load_->setEnabled(false);
   run_->setEnabled(false);
@@ -971,6 +981,9 @@ void MainWindow::runDetection() {
   const auto input = cloud_;
   const auto config = resultConfig_;
   const auto frames = frames_;
+  const bool generateSurfaceModels = resultGenerateSurfaceModels_;
+  appendLog(generateSurfaceModels ? QStringLiteral("曲面模型拟合：开启")
+                                 : QStringLiteral("曲面模型拟合：关闭，仅生成点云"));
   if (!frames.empty())
     appendLog(QStringLiteral(
                   "按 %1 个原始帧提取：轮廓投影合并 %2 帧，保留当前帧号与扫描平面。")
@@ -978,12 +991,12 @@ void MainWindow::runDetection() {
                   .arg(config.mergeProfileFrames ? config.profileMergeFrameCount : 1));
   if (config.debugFlag) {
     // VTK 和模态步骤窗口只在主线程创建；调试模式逐步等待用户继续。
-    QTimer::singleShot(0, this, [this, input, config, frames] {
+    QTimer::singleShot(0, this, [this, input, config, frames, generateSurfaceModels] {
       DetectionRun run;
       QElapsedTimer algorithmTimer;
       algorithmTimer.start();
       try {
-        run.result = detectWithDebugViewer(input, config, this, frames);
+        run.result = detectWithDebugViewer(input, config, this, frames, generateSurfaceModels);
       } catch (const std::exception &e) {
         run.result.summary = e.what();
       } catch (...) {
@@ -994,13 +1007,13 @@ void MainWindow::runDetection() {
     });
     return;
   }
-  watcher_.setFuture(QtConcurrent::run([input, config, frames] {
+  watcher_.setFuture(QtConcurrent::run([input, config, frames, generateSurfaceModels] {
     DetectionRun run;
     QElapsedTimer algorithmTimer;
     algorithmTimer.start();
     try {
       run.result = SeamDetector().detect(input, config, nullptr, nullptr, nullptr,
-                                         &frames);
+                                         &frames, generateSurfaceModels);
     } catch (const std::exception &e) {
       run.result.summary = e.what();
     } catch (...) {
@@ -1035,6 +1048,8 @@ bool MainWindow::saveResultToPath(const QString &path, QString *error) {
     return false;
   }
   if (!saveResults(path, result_, resultConfig_, error)) return false;
+  if (!resultGenerateSurfaceModels_)
+    appendLog(QStringLiteral("本次未拟合曲面；曲面模型 JSON 保存为空模型（not_fitted），覆盖同名旧模型，避免误用旧结果。"));
   appendLog(QStringLiteral("已保存到：%1；%2；三个面为 *_left_surface.pcd、*_right_surface.pcd、*_weld_surface.pcd，曲面函数为 *_left_surface_model.json、*_weld_surface_model.json、*_right_surface_model.json，另附 CSV 和参数 JSON。")
                 .arg(QFileInfo(path).absolutePath())
                 .arg(result_.centerSeam->empty()

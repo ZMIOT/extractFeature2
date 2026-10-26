@@ -48,13 +48,14 @@ int main(int argc, char **argv) {
     auto *regionFraction = window.findChild<QDoubleSpinBox *>("profileTurnRegionFraction");
     auto *wallTolerance = window.findChild<QDoubleSpinBox *>("profileWallTolerance");
     auto *widthRule = window.findChild<QCheckBox *>("adaptiveSeamCount");
+    auto *surfaceModels = window.findChild<QCheckBox *>("generateSurfaceModels");
     auto *doubleWidth = window.findChild<QDoubleSpinBox *>("doubleSeamWidth");
     auto *debugStart = window.findChild<QSpinBox *>("debugStartSlice");
     auto *debugPosition = window.findChild<QLabel *>("debugSlicePosition");
     const bool defaultsOk = advanced && surface && floor && floorSize && floorGuard &&
         maxCorrection && floorRms && turn && localization && spline && trim &&
         radius && beadHeight && beadWidth && regionLength && regionFraction && wallTolerance && widthRule && doubleWidth &&
-        debugStart && debugPosition &&
+        debugStart && debugPosition && surfaceModels && surfaceModels->isChecked() &&
         !surface->isChecked() && !widthRule->isChecked() &&
         turn->count() == 5 && turn->currentIndex() == 4 &&
         localization->count() == 2 && localization->currentIndex() == 1 &&
@@ -228,7 +229,10 @@ int main(int argc, char **argv) {
                          app.exit(ok && layersOk && saved && exported ? 0 : 8);
                        });
                      });
-    QTimer::singleShot(500, &app, [&window, &app, input, debugStart] {
+    const bool generateSurfaceModels = !args.contains("--no-surface-models");
+    // Apply output options once the GUI event loop can service redraws.
+    QTimer::singleShot(500, &app, [&window, &app, input, debugStart, generateSurfaceModels] {
+      window.findChild<QCheckBox *>("generateSurfaceModels")->setChecked(generateSurfaceModels);
       std::fprintf(stderr,"Loading input\n");std::fflush(stderr);
       if (!window.loadPath(input)) {
         app.exit(7);

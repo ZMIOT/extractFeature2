@@ -45,10 +45,15 @@ bool extractWeldClouds(const weld::CloudT::ConstPtr& input,
                       weld::SeamClouds& output,
                       std::string& error)
 {
-    return weld::extractSeams(input, output,
+    const bool generateSurfaceModels = true;
+    return weld::extractSeams(input, output, generateSurfaceModels,
                               weld::defaultDetectorConfig(), &error);
 }
 ```
+
+第三个参数控制是否生成曲面模型：传 `false`（或 `0`）时只生成轨迹和三个实测面点云，
+跳过耗时的 B 样条拟合，此时三个 `SurfaceModel` 均为空且 `message == "not_fitted"`；
+传 `true`（或 `1`）时点云和曲面模型都生成。不传该参数的旧调用方式保持原行为，即生成曲面模型。
 
 `weld::CloudT` 即 `pcl::PointCloud<pcl::PointXYZ>`。返回点云如下：
 

@@ -29,7 +29,7 @@ int main() {
     CHECK(expected.ok());
     weld::SeamClouds output;
     error = "stale error";
-    CHECK(weld::extractSeams(input, output, config, &error, &frames));
+    CHECK(weld::extractSeams(input, output, 1, config, &error, &frames));
     CHECK(error.empty());
     CHECK(same(*output.left, *expected.leftSeam));
     CHECK(same(*output.right, *expected.rightSeam));
@@ -48,6 +48,18 @@ int main() {
     CHECK((fitted-reference).norm()<1e-10);
     CHECK(single ? !output.center->empty() : !output.left->empty() && !output.right->empty());
     CHECK(same(*input, unchanged));
+    const auto tracksAndClouds=output;
+    CHECK(weld::extractSeams(input, output, 0, config, &error, &frames));
+    CHECK(error.empty());
+    CHECK(same(*output.left,*tracksAndClouds.left) && same(*output.right,*tracksAndClouds.right) &&
+          same(*output.center,*tracksAndClouds.center));
+    CHECK(same(*output.leftSurface,*tracksAndClouds.leftSurface) &&
+          same(*output.rightSurface,*tracksAndClouds.rightSurface) &&
+          same(*output.weldSurface,*tracksAndClouds.weldSurface));
+    for(const auto *model:{&output.leftSurfaceModel,&output.weldSurfaceModel,&output.rightSurfaceModel}) {
+      CHECK(!model->valid());
+      CHECK(model->patches.empty() && model->rejectedPatchCount==0 && model->message=="not_fitted");
+    }
     auto invalid = config; invalid.sliceStep = 0;
     CHECK(!weld::extractSeams(input, output, invalid, &error));
     CHECK(!error.empty() && output.left->empty() && output.right->empty() && output.center->empty());

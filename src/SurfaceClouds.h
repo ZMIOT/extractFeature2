@@ -18,5 +18,6 @@ struct SurfaceSection {
 void extractSurfaceClouds(const CloudT::ConstPtr &source,
                           const std::vector<SurfaceSection> &sections,
                           const DetectorConfig &config, SeamResult &result,
-                          const std::vector<ScanFrameRange> *frames = nullptr);
+                          const std::vector<ScanFrameRange> *frames = nullptr,
+                          bool generateSurfaceModels = true);
 }

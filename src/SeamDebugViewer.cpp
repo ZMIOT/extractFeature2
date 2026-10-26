@@ -433,10 +433,11 @@ private:
 
 SeamResult detectWithDebugViewer(const CloudT::ConstPtr &input,
                                  const DetectorConfig &config, QWidget *parent,
-                                 const std::vector<ScanFrameRange> &frames) {
+                                 const std::vector<ScanFrameRange> &frames,
+                                 bool generateSurfaceModels) {
   if (!config.debugFlag)
     return SeamDetector().detect(input, config, nullptr, nullptr, nullptr,
-                                 &frames);
+                                 &frames, generateSurfaceModels);
   if (!qobject_cast<QApplication *>(QCoreApplication::instance()) ||
       QThread::currentThread() != QCoreApplication::instance()->thread())
     throw std::runtime_error(
@@ -450,7 +451,7 @@ SeamResult detectWithDebugViewer(const CloudT::ConstPtr &input,
     return viewer.handleStep(step);
   };
   const auto result = SeamDetector().detect(input, config, nullptr, nullptr, &trace,
-                                            &frames);
+                                            &frames, generateSurfaceModels);
   if (!result.ok() && trace.onStep) {
     DebugStep failed;
     failed.title = "本次提取未生成可靠焊缝";

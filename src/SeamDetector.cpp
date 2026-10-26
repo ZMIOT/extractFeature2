@@ -5282,7 +5282,8 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
                                 const DetectorConfig &config,
                                 const SeamHistory *leftHistory,
                                 const SeamHistory *rightHistory,
-                                DebugTrace *debug, const std::vector<ScanFrameRange> *frames) const {
+                                DebugTrace *debug, const std::vector<ScanFrameRange> *frames,
+                                bool generateSurfaceModels) const {
   SeamResult result;
   auto stageStarted = std::chrono::steady_clock::now();
   auto finishStage = [&](const std::string &name) {
@@ -5604,7 +5605,8 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
     surfaceSections.push_back(section);
   }
   extractSurfaceClouds(sourceInput,surfaceSections,workingConfig,result,
-      frameBased ? (config.extractMainBody ? &bodyFrames : detectionFrames) : nullptr);
+      frameBased ? (config.extractMainBody ? &bodyFrames : detectionFrames) : nullptr,
+      generateSurfaceModels);
   finishStage("surface_extraction");
   if(config.uniformWidthEnabled) {
     std::vector<UniformWidthSection> sections(leftPath.size());
@@ -5674,6 +5676,7 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
       std::to_string(result.rightSurface->size())+"/"+std::to_string(result.weldSurface->size())+".";
   result.summary+=" B-spline patches L/weld/R="+std::to_string(result.leftSurfaceModel.patches.size())+"/"+
       std::to_string(result.weldSurfaceModel.patches.size())+"/"+std::to_string(result.rightSurfaceModel.patches.size())+".";
+  if(!generateSurfaceModels) result.summary+=" B-spline fitting disabled.";
   publishDebugStep(debug, "S17 最终焊缝",
                    {{"处理后点云", result.filteredCloud},
                     {"左焊缝", result.leftSeam},

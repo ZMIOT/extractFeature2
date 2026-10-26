@@ -9,5 +9,6 @@ namespace weld {
 SeamResult
 detectWithDebugViewer(const CloudT::ConstPtr &input,
                       const DetectorConfig &config, QWidget *parent = nullptr,
-                      const std::vector<ScanFrameRange> &frames = {});
+                      const std::vector<ScanFrameRange> &frames = {},
+                      bool generateSurfaceModels = true);
 } // namespace weld
