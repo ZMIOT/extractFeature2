@@ -1,5 +1,6 @@
 #include "SurfaceClouds.h"
 #include "SurfaceFitting.h"
+#include "GpuSurfaceNormals.h"
 #include <pcl/common/point_tests.h>
 #include <pcl/kdtree/kdtree_flann.h>
 #include <Eigen/Eigenvalues>
@@ -7,6 +8,7 @@
 #include <cmath>
 #include <map>
 #include <array>
+#include <chrono>
 #include <limits>
 
 namespace weld {
@@ -122,6 +124,7 @@ void extractSurfaceClouds(const CloudT::ConstPtr &source,
   result.weldSurfaceModel=BSplineSurfaceModel{};
   result.rightSurfaceModel=BSplineSurfaceModel{};
   if (!source || sections.empty()) return;
+  const auto classificationStarted=std::chrono::steady_clock::now();
   const int a = int(config.longitudinalAxis), u = a == 0 ? 1 : 0,
             v = a == 2 ? 1 : 2;
   const float radius = std::max(.5f, config.profileBinSize);
@@ -158,6 +161,11 @@ void extractSurfaceClouds(const CloudT::ConstPtr &source,
     }
   }
   std::vector<unsigned char> labels(source->size(), 0);
+  detail::GpuSurfaceNormals gpuNormalBatch;
+  const bool gpuNormals=detail::computeSurfaceNormalsGpu(
+      *source,groups,u,v,radius,gpuNormalBatch);
+  if(gpuNormals)
+    result.stageMilliseconds["gpu_surface_normals"]=gpuNormalBatch.milliseconds;
   for (std::size_t s=0; s<sections.size(); ++s) {
     const auto &section = sections[s];
     const auto &indices = groups[s];
@@ -170,32 +178,43 @@ void extractSurfaceClouds(const CloudT::ConstPtr &source,
       const auto &p = (*source)[i];
       profile->push_back(PointT(p.data[u], p.data[v], 0));
     }
-    pcl::KdTreeFLANN<PointT> tree;
-    tree.setInputCloud(profile);
-    std::vector<int> neighbors;
-    std::vector<float> distances;
     std::vector<Eigen::Vector2f> normals(indices.size(),Eigen::Vector2f::Zero());
     std::vector<bool> supported(indices.size(),false);
     std::array<std::vector<Eigen::Vector2f>,2> wallSeeds;
-    for (std::size_t j=0; j<indices.size(); ++j) {
-      const auto &p = (*profile)[j];
-      tree.radiusSearch(p, radius, neighbors, distances, 64);
-      if (neighbors.size()<5) continue;
-      supported[j]=true;
-      Eigen::Vector2f center = Eigen::Vector2f::Zero();
-      for (int k : neighbors) center += Eigen::Vector2f((*profile)[k].x, (*profile)[k].y);
-      center /= float(neighbors.size());
-      Eigen::Matrix2f covariance = Eigen::Matrix2f::Zero();
-      for (int k : neighbors) {
-        const Eigen::Vector2f delta = Eigen::Vector2f((*profile)[k].x, (*profile)[k].y)-center;
-        covariance.noalias() += delta*delta.transpose();
+    if(gpuNormals) {
+      for(std::size_t j=0;j<indices.size();++j) {
+        supported[j]=gpuNormalBatch.supported[s][j]!=0;
+        normals[j]=gpuNormalBatch.normals[s][j];
       }
-      covariance /= float(neighbors.size());
-      Eigen::SelfAdjointEigenSolver<Eigen::Matrix2f> fit(covariance);
-      if (fit.info()!=Eigen::Success || fit.eigenvalues()[1]<1.e-5f ||
-          fit.eigenvalues()[0]>.15f*fit.eigenvalues().sum()) continue;
-      const Eigen::Vector2f normal = fit.eigenvectors().col(0);
-      normals[j]=normal;
+    } else {
+      pcl::KdTreeFLANN<PointT> tree;
+      tree.setInputCloud(profile);
+      std::vector<int> neighbors;
+      std::vector<float> distances;
+      for (std::size_t j=0; j<indices.size(); ++j) {
+        const auto &p = (*profile)[j];
+        tree.radiusSearch(p, radius, neighbors, distances, 64);
+        if (neighbors.size()<5) continue;
+        supported[j]=true;
+        Eigen::Vector2f center = Eigen::Vector2f::Zero();
+        for (int k : neighbors) center += Eigen::Vector2f((*profile)[k].x, (*profile)[k].y);
+        center /= float(neighbors.size());
+        Eigen::Matrix2f covariance = Eigen::Matrix2f::Zero();
+        for (int k : neighbors) {
+          const Eigen::Vector2f delta = Eigen::Vector2f((*profile)[k].x, (*profile)[k].y)-center;
+          covariance.noalias() += delta*delta.transpose();
+        }
+        covariance /= float(neighbors.size());
+        Eigen::SelfAdjointEigenSolver<Eigen::Matrix2f> fit(covariance);
+        if (fit.info()!=Eigen::Success || fit.eigenvalues()[1]<1.e-5f ||
+            fit.eigenvalues()[0]>.15f*fit.eigenvalues().sum()) continue;
+        normals[j]=fit.eigenvectors().col(0);
+      }
+    }
+    for (std::size_t j=0; j<indices.size(); ++j) {
+      if(!supported[j])continue;
+      const auto &p = (*profile)[j];
+      const Eigen::Vector2f normal=normals[j];
       const Eigen::Vector2f point(p.x, p.y);
       const bool isLeft = p.x < middle;
       const auto &toe = isLeft ? left : right;
@@ -307,10 +326,17 @@ void extractSurfaceClouds(const CloudT::ConstPtr &source,
     else if (labels[i]==2) result.rightSurface->push_back((*source)[i]);
     else if (labels[i]==3) result.weldSurface->push_back((*source)[i]);
   }
+  result.stageMilliseconds["surface_cloud_classification"]=
+      std::chrono::duration<double,std::milli>(
+          std::chrono::steady_clock::now()-classificationStarted).count();
   if (generateSurfaceModels) {
+    const auto modelStarted=std::chrono::steady_clock::now();
     result.leftSurfaceModel=fitSurfaceModel(*source,groups,sections,labels,1,config);
     result.weldSurfaceModel=fitSurfaceModel(*source,groups,sections,labels,3,config);
     result.rightSurfaceModel=fitSurfaceModel(*source,groups,sections,labels,2,config);
+    result.stageMilliseconds["surface_model_fitting"]=
+        std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-modelStarted).count();
   }
 }
 }

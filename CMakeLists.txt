@@ -21,7 +21,8 @@ endif()
 # Memory-in / memory-out library. No PCL io, Qt or VTK in this target.
 add_library(seam_core SHARED src/SeamDetector.cpp src/UniformSeamWidth.cpp src/InputSampling.cpp
   src/ProfileCurvature.cpp src/HullSurfaces.cpp src/SeamSmoother.cpp
-  src/SeamHistory.cpp src/ConfigIO.cpp src/WeldSeam.cpp src/SurfaceClouds.cpp src/BSplineSurface.cpp)
+  src/SeamHistory.cpp src/ConfigIO.cpp src/WeldSeam.cpp src/SurfaceClouds.cpp src/BSplineSurface.cpp
+  src/GpuSurfaceNormals.cpp)
 set_target_properties(seam_core PROPERTIES OUTPUT_NAME WeldSeam EXPORT_NAME WeldSeam
   WINDOWS_EXPORT_ALL_SYMBOLS ON DEBUG_POSTFIX d AUTOMOC OFF)
 add_library(WeldSeam::WeldSeam ALIAS seam_core)
@@ -107,6 +108,12 @@ if(BUILD_TESTING)
   add_test(NAME candidate_parallel_equivalence COMMAND candidate_parallel_test)
   set_tests_properties(candidate_parallel_equivalence PROPERTIES TIMEOUT 180)
   list(APPEND _weld_targets candidate_parallel_test)
+  add_executable(gpu_surface_normals_test tests/test_gpu_surface_normals.cpp)
+  target_link_libraries(gpu_surface_normals_test PRIVATE seam_core)
+  target_include_directories(gpu_surface_normals_test SYSTEM PRIVATE ${PCL_FLANN_INCLUDE_DIR})
+  add_test(NAME opencl_surface_normals_equivalence COMMAND gpu_surface_normals_test)
+  set_tests_properties(opencl_surface_normals_equivalence PROPERTIES TIMEOUT 60)
+  list(APPEND _weld_targets gpu_surface_normals_test)
   add_executable(seam_diagnostic tests/detect_diagnostic.cpp)
   target_link_libraries(seam_diagnostic PRIVATE seam_core seam_test_io)
   list(APPEND _weld_targets seam_test_io seam_detector_test config_io_test cloud_api_test surface_clouds_test seam_diagnostic)

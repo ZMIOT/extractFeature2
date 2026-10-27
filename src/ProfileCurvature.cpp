@@ -389,8 +389,14 @@ std::vector<ProfileCurvatureSample> fitParametricProfileSpline(
   }
   for (double s=0;s<=length;s+=sampleStep) {
     const auto &b=basis(s);
-    const Eigen::Vector2d point=origin+controls.transpose()*b.col(0);
-    const Eigen::Vector2d velocity=controls.transpose()*b.col(1), acceleration=controls.transpose()*b.col(2);
+    Eigen::Vector2d point=origin,velocity=Eigen::Vector2d::Zero(),
+                    acceleration=Eigen::Vector2d::Zero();
+    // A cubic span has only four nonzero rows. Avoid multiplying every zero
+    // control row for each output sample; keep the row order deterministic.
+    for(int i=activeFirst;i<activeFirst+activeCount;++i) {
+      const auto control=controls.row(i).transpose();
+      point+=b(i,0)*control;velocity+=b(i,1)*control;acceleration+=b(i,2)*control;
+    }
     const double speed=velocity.norm();
     ProfileCurvatureSample sample;
     sample.point=point.cast<float>(); sample.rms=float(rms);
