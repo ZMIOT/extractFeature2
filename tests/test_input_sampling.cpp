@@ -5,6 +5,8 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <set>
+#include <array>
 
 namespace {
 void require(bool condition,const char* message) {
@@ -46,6 +48,22 @@ void samplingRules() {
   extreme->push_back({-1.e30f,0,0});extreme->push_back({1.e30f,0,0});
   const auto large=weld::sampleMeasuredInput(extreme,1.e-6f);
   require(large.error.empty() && same(*large.cloud,*extreme),"Extreme coordinates overflowed voxel keys");
+  weld::CloudT::Ptr support(new weld::CloudT);
+  support->push_back((*input)[1]);
+  const std::vector<weld::ScanFrameRange> supportFrames{{0,1,10}};
+  const auto detail=weld::recoverMeasuredFrameSupport(input,frames,support,supportFrames,.1f);
+  require(detail.error.empty() && detail.cloud->size()==4 && detail.frames.size()==1 &&
+          detail.frames[0].frameIndex==10,"Detail recovery crossed a missing frame or lost cell support");
+  for(std::size_t i=0;i<4;++i)
+    require(weld::toVector((*detail.cloud)[i])==weld::toVector((*input)[i]),
+            "Detail recovery changed measured coordinates/order");
+  auto missing=supportFrames;missing[0].frameIndex=15;
+  require(!weld::recoverMeasuredFrameSupport(input,frames,support,missing,.1f).error.empty(),
+          "Detail recovery accepted a nonexistent source frame");
+  weld::CloudT::Ptr separated(new weld::CloudT(*input));
+  (*separated)[3].x=.3f;
+  const auto bounded=weld::recoverMeasuredFrameSupport(separated,frames,support,supportFrames,.1f);
+  require(bounded.error.empty() && bounded.cloud->size()==3,"Detail recovery leaked into a rejected cell");
 }
 void commonPipeline(bool framed,bool mainBody) {
   weld::CloudT::Ptr input(new weld::CloudT);
@@ -70,10 +88,28 @@ void commonPipeline(bool framed,bool mainBody) {
   require(actual.ok() && expected.ok(),"Sampled groove detection failed");
   require(actual.inputSamplingPoints==sampled.cloud->size() &&
           actual.inputSamplingRemovedPoints==input->size()-sampled.cloud->size(),"Sampling counts incorrect");
-  require(same(*actual.leftSeam,*expected.leftSeam) && same(*actual.rightSeam,*expected.rightSeam) &&
+  if (!framed) require(same(*actual.leftSeam,*expected.leftSeam) && same(*actual.rightSeam,*expected.rightSeam) &&
           same(*actual.leftSurface,*expected.leftSurface) && same(*actual.rightSurface,*expected.rightSurface) &&
           same(*actual.weldSurface,*expected.weldSurface) && same(*actual.mainBodyCloud,*expected.mainBodyCloud),
           "A downstream stage used the original cloud or applied another voxel pass");
+  require(same(*actual.mainBodyCloud,*expected.mainBodyCloud),"Body output no longer uses sampled points");
+  if (framed) {
+    const auto reference=weld::SeamDetector().detect(input,config,nullptr,nullptr,nullptr,&frames);
+    require(reference.ok() && actual.leftFrameIndices==reference.leftFrameIndices &&
+            actual.rightFrameIndices==reference.rightFrameIndices,"Measured detail changed frame coverage");
+    for (int side=0;side<2;++side) {
+      const auto &a=side?actual.rightSeam:actual.leftSeam;
+      const auto &b=side?reference.rightSeam:reference.leftSeam;
+      for(std::size_t i=0;i<a->size();++i)
+        require((weld::toVector((*a)[i])-weld::toVector((*b)[i])).norm()<.1f,
+                "Framed trajectory lost full-resolution detail");
+    }
+    std::set<std::array<float,3>> measured;
+    for(const auto &p:*sampled.cloud) measured.insert({{p.x,p.y,p.z}});
+    for(const auto &surface:{actual.leftSurface,actual.weldSurface,actual.rightSurface})
+      for(const auto &p:*surface)
+        require(measured.count({{p.x,p.y,p.z}})>0,"Surface output contains a generated or unsampled point");
+  }
   require(actual.leftFrameIndices==expected.leftFrameIndices && actual.rightFrameIndices==expected.rightFrameIndices,
           "Sampling changed frame identity inside the pipeline");
 }
@@ -82,6 +118,6 @@ int main() {
   try {
     samplingRules();
     for(bool framed:{false,true})for(bool mainBody:{false,true})commonPipeline(framed,mainBody);
-    std::cout<<"Input sampling: measured subsets, frame identity and shared downstream cloud passed\n";
+    std::cout<<"Input sampling: measured subsets, frame identity, bounded detail and sparse outputs passed\n";
   } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}
 }

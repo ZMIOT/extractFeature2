@@ -318,7 +318,7 @@ void MainWindow::buildUi() {
   trimEndpoints_ = new QCheckBox(QStringLiteral("首尾大幅变动处截断"),parameters_);
   trimEndpoints_->setObjectName("trimUnstableEndpoints");
   trimEndpoints_->setToolTip(QStringLiteral("从稳定段向首尾检查方向变化和偏离量；连续异常达到确认长度时，去掉外侧尾段。两侧同步截断，保留中间真实弯曲。"));
-  inputVoxel_ = spin(0, 1000000000, .001, QStringLiteral("直接输入降采样 size，支持最多六位小数，0 关闭。单位与点云一致；数值越大，通常保留的点越少。按原始帧保留实测代表点，所有后续算法阶段使用采样后的点云。"));
+  inputVoxel_ = spin(0, 1000000000, .001, QStringLiteral("直接输入降采样 size，支持最多六位小数，0 关闭。单位与点云一致；数值越大，通常保留的点越少。有原始帧时，主体筛选和面输出使用采样点，轨迹恢复保留主体单元内的原始轮廓，帧几何不随采样改变；无帧号时各阶段使用采样点。较大的 size 仍可能改变主体范围。"));
   inputVoxel_->setObjectName("inputVoxelSize");
   inputVoxel_->setDecimals(6);
   inputVoxel_->setButtonSymbols(QAbstractSpinBox::NoButtons);

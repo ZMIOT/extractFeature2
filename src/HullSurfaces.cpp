@@ -13,10 +13,33 @@
 #include <limits>
 #include <stdexcept>
 #include <set>
+#include <future>
+#include <thread>
 #include <Eigen/Cholesky>
 
 namespace weld {
 namespace {
+// Independent point queries only. Each block owns its search scratch space;
+// trees are built before dispatch and remain read-only until all workers join.
+// Keep callbacks on the caller thread by using the original serial path when
+// cancellation is supplied. Small clouds do not pay thread startup overhead.
+template <class Work>
+void pointBlocks(std::size_t count, bool serial, const Work &work) {
+  const std::size_t workers = serial ? 1 : std::max<std::size_t>(1,
+      std::min({std::size_t(4), std::size_t(std::thread::hardware_concurrency()),
+                count / 4096}));
+  if (workers == 1) { work(0, count); return; }
+  std::vector<std::future<void>> pending;
+  pending.reserve(workers - 1);
+  for (std::size_t block = 1; block < workers; ++block) {
+    pending.push_back(std::async(std::launch::async, [&, block] {
+      work(count * block / workers, count * (block + 1) / workers);
+    }));
+  }
+  work(0, count / workers);
+  for (auto &task : pending) task.get();
+}
+
 using Basis = Eigen::Matrix<double,6,1>;
 Basis basis(double x,double y) {Basis b;b<<1,x,y,x*x,x*y,y*y;return b;}
 float cross(const Eigen::Vector2f& a,const Eigen::Vector2f& b) {return a.x()*b.y()-a.y()*b.x();}
@@ -169,19 +192,22 @@ HullSurfacesResult extractHullSurfaces(const CloudT::ConstPtr &input,
   std::vector<float> curvature(n,1), spread(n,0);
   std::vector<int> ids;std::vector<float> distances;
   const float radius=3.5f*grid;
-  for(std::size_t i=0;i<n;++i) {
-    if((i&255u)==0)check();
-    tree.radiusSearch((*samples)[i],radius,ids,distances,64);
-    if(ids.size()<8)continue;
-    Eigen::Vector3f center=Eigen::Vector3f::Zero();
-    for(int j:ids)center+=toVector((*samples)[j]);center/=float(ids.size());
-    Eigen::Matrix3f cov=Eigen::Matrix3f::Zero();
-    for(int j:ids){const Eigen::Vector3f d=toVector((*samples)[j])-center;cov+=d*d.transpose();}
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> solver(cov);
-    if(solver.info()!=Eigen::Success)continue;
-    const auto e=solver.eigenvalues();normals[i]=solver.eigenvectors().col(0);
-    curvature[i]=e[0]/std::max(1e-10f,e.sum());spread[i]=e[1]/std::max(1e-10f,e[2]);
-  }
+  pointBlocks(n, bool(cancelled), [&](std::size_t begin, std::size_t end) {
+    std::vector<int> ids;std::vector<float> distances;
+    for(std::size_t i=begin;i<end;++i) {
+      if((i&255u)==0)check();
+      tree.radiusSearch((*samples)[i],radius,ids,distances,64);
+      if(ids.size()<8)continue;
+      Eigen::Vector3f center=Eigen::Vector3f::Zero();
+      for(int j:ids)center+=toVector((*samples)[j]);center/=float(ids.size());
+      Eigen::Matrix3f cov=Eigen::Matrix3f::Zero();
+      for(int j:ids){const Eigen::Vector3f d=toVector((*samples)[j])-center;cov+=d*d.transpose();}
+      Eigen::SelfAdjointEigenSolver<Eigen::Matrix3f> solver(cov);
+      if(solver.info()!=Eigen::Success)continue;
+      const auto e=solver.eigenvalues();normals[i]=solver.eigenvectors().col(0);
+      curvature[i]=e[0]/std::max(1e-10f,e.sum());spread[i]=e[1]/std::max(1e-10f,e[2]);
+    }
+  });
   std::vector<int> category(n,0);
   for(std::size_t i=0;i<n;++i)category[i]=std::abs(normals[i][u])>.7f?1:0;
   std::vector<int> labels(n,-1);std::vector<std::vector<int>> regions;
@@ -262,45 +288,64 @@ HullSurfacesResult extractHullSurfaces(const CloudT::ConstPtr &input,
   CloudT::Ptr patchCenters(new CloudT);
   for(const auto& patch:patches)patchCenters->push_back(PointT(patch.center.x(),patch.center.y(),patch.center.z()));
   pcl::KdTreeFLANN<PointT> patchTree;if(!patchCenters->empty())patchTree.setInputCloud(patchCenters);
-  std::vector<int> patchIds;std::vector<float> patchDistances;
-  for(std::size_t i=0;i<input->size();++i) {
-    if((i&1023u)==0)check();const auto &p=(*input)[i];if(!pcl::isFinite(p))continue;
-    if(p.x<supportMinimum.x() || p.x>supportMaximum.x() ||
-       p.y<supportMinimum.y() || p.y>supportMaximum.y() ||
-       p.z<supportMinimum.z() || p.z>supportMaximum.z())continue;
-    anchorTree.nearestKSearch(p,1,ids,distances);
-    if(ids.empty())continue;
-    const int j=anchorIds[ids[0]];
-    int family=selected[j];
-    bool retained=distances[0]<=4.f*grid*grid && std::abs(normals[j].dot(toVector(p)-toVector((*samples)[j])))<=config.hullSurfaceDistance;
-    const bool originalSupport=retained;
-    bool strictSupport=retained;
-    bool nearSurface=false;
-    if(!retained&&!patches.empty()&&distances[0]<=patchRadius*patchRadius) {
-      // Evaluate all bounded charts in range: adding a nearby wall/raw chart
-      // must not crowd a valid floor chart out of a fixed nearest-K shortlist.
-      patchTree.radiusSearch(p,patchRadius,patchIds,patchDistances);
-      for(std::size_t k=0;k<patchIds.size();++k) {
-        if(patchDistances[k]>patchRadius*patchRadius)break;
-        const auto& patch=patches[patchIds[k]];const Eigen::Vector3f delta=toVector(p)-patch.center;
-        const Eigen::Vector2f uv(delta.dot(patch.tangent)/patchRadius,delta.dot(patch.bitangent)/patchRadius);
-        // Only interpolate within measured support, with half a voxel of edge
-        // tolerance; never use an unbounded plane to pull in external clutter.
-        if(!patch.contains(uv,.5f*grid/patchRadius))continue;
-        const double residual=std::abs(delta.dot(patch.normal)-patch.coefficients.dot(basis(uv.x(),uv.y())));
-        nearSurface|=residual<3*config.hullSurfaceDistance;
-        // A cleanup mask is NOT a fitted surface. Retain original points in
-        // this bounded band, including rough weld toes and local deformation.
-        // Keep searching for strict support to classify uncertain points
-        // independently of patch iteration order. No recovered point grows ROI.
-        if(residual<=preservationDistance){retained=true;family=patch.family;}
-        if(residual<=config.hullSurfaceDistance){strictSupport=true;break;}
+  struct Classification {
+    int family = -1;
+    bool recovered = false, uncertain = false, rejectedNearSurface = false;
+  };
+  std::vector<Classification> classified(input->size());
+  pointBlocks(input->size(), bool(cancelled), [&](std::size_t begin, std::size_t end) {
+    std::vector<int> ids, patchIds;
+    std::vector<float> distances, patchDistances;
+    for(std::size_t i=begin;i<end;++i) {
+      if((i&1023u)==0)check();const auto &p=(*input)[i];if(!pcl::isFinite(p))continue;
+      if(p.x<supportMinimum.x() || p.x>supportMaximum.x() ||
+         p.y<supportMinimum.y() || p.y>supportMaximum.y() ||
+         p.z<supportMinimum.z() || p.z>supportMaximum.z())continue;
+      anchorTree.nearestKSearch(p,1,ids,distances);
+      if(ids.empty())continue;
+      const int j=anchorIds[ids[0]];
+      int family=selected[j];
+      bool retained=distances[0]<=4.f*grid*grid && std::abs(normals[j].dot(toVector(p)-toVector((*samples)[j])))<=config.hullSurfaceDistance;
+      const bool originalSupport=retained;
+      bool strictSupport=retained;
+      bool nearSurface=false;
+      if(!retained&&!patches.empty()&&distances[0]<=patchRadius*patchRadius) {
+        // Evaluate all bounded charts in range: adding a nearby wall/raw chart
+        // must not crowd a valid floor chart out of a fixed nearest-K shortlist.
+        patchTree.radiusSearch(p,patchRadius,patchIds,patchDistances);
+        for(std::size_t k=0;k<patchIds.size();++k) {
+          if(patchDistances[k]>patchRadius*patchRadius)break;
+          const auto& patch=patches[patchIds[k]];const Eigen::Vector3f delta=toVector(p)-patch.center;
+          const Eigen::Vector2f uv(delta.dot(patch.tangent)/patchRadius,delta.dot(patch.bitangent)/patchRadius);
+          // Only interpolate within measured support, with half a voxel of edge
+          // tolerance; never use an unbounded plane to pull in external clutter.
+          if(!patch.contains(uv,.5f*grid/patchRadius))continue;
+          const double residual=std::abs(delta.dot(patch.normal)-patch.coefficients.dot(basis(uv.x(),uv.y())));
+          nearSurface|=residual<3*config.hullSurfaceDistance;
+          // A cleanup mask is NOT a fitted surface. Retain original points in
+          // this bounded band, including rough weld toes and local deformation.
+          // Keep searching for strict support to classify uncertain points
+          // independently of patch iteration order. No recovered point grows ROI.
+          if(residual<=preservationDistance){retained=true;family=patch.family;}
+          if(residual<=config.hullSurfaceDistance){strictSupport=true;break;}
+        }
       }
+      auto &classification = classified[i];
+      if(!retained){classification.rejectedNearSurface=nearSurface;continue;}
+      classification.family=family;
+      classification.recovered=!originalSupport;
+      classification.uncertain=!strictSupport;
     }
-    if(!retained){result.rejectedNearSurfacePoints+=nearSurface;continue;}
-    if(!originalSupport)result.recoveredIndices.push_back(i);
-    if(!strictSupport)result.protectedUncertainIndices.push_back(i);
-    result.cloud->push_back(p);result.sourceIndices.push_back(i);result.surfaceIds.push_back(std::uint32_t(family));
+  });
+  // Stable compaction preserves input order and the public source-index mapping.
+  for(std::size_t i=0;i<input->size();++i) {
+    const auto &classification=classified[i];
+    result.rejectedNearSurfacePoints+=classification.rejectedNearSurface;
+    if(classification.family<0)continue;
+    if(classification.recovered)result.recoveredIndices.push_back(i);
+    if(classification.uncertain)result.protectedUncertainIndices.push_back(i);
+    result.cloud->push_back((*input)[i]);result.sourceIndices.push_back(i);
+    result.surfaceIds.push_back(std::uint32_t(classification.family));
   }
   if(result.cloud->size()<100)result.error="Surface support too small";
   return result;

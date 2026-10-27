@@ -4,8 +4,9 @@
  * 目标：从槽形点云中输出左右两条焊缝，并使可靠点同时位于局部底面和侧壁。
  * 坐标：A 为 longitudinalAxis；U/V 是 transverseAxes(A) 返回的两个截面轴。
  *       L 是 U 较小的一侧，R 是 U 较大的一侧，与屏幕左右、全局上下无关。
- * 数据：入口采样保留实测点；后续主体、候选、精修和面提取共用采样点云。
- *       filteredCloud 用于搜索结构；局部侧壁/底面精修读取采样后的实测源点。
+ * 数据：入口采样保留实测点；主体筛选和面输出使用采样点云。
+ *       原始帧模式在保留主体单元内恢复完整实测轮廓供轨迹定位与精修，
+ *       帧站位及扫描平面始终从原始帧确定；空间切片仍使用采样点。
  *       不能把降采样中值点当作最后的实测平面支持，否则会再次产生偏移。
  *
  * 主流程索引（在编辑器中搜索对应 S 编号；文档使用相同编号）：
@@ -31,6 +32,7 @@
 #include "HullSurfaces.h"
 #include "SurfaceClouds.h"
 #include "InputSampling.h"
+#include "CandidateExecutor.h"
 
 #include <pcl/common/common.h>
 #include <pcl/common/point_tests.h>
@@ -546,13 +548,25 @@ bool intersectLines(const Line2D &first, const Line2D &second,
 // 代表点取各坐标中位数供定位；另外保留 support/fitMean/fitScatter 供面拟合。
 // 当箱内纵向跨度足够时扣除局部纵向线性趋势，减轻厚截面在弯曲区的混叠。
 // 断点观察：points.size()、result.size()、每箱 support 和 fitScatter。
-std::vector<ProfilePoint> makeProfile(const std::vector<PointT> &points,
+std::vector<PointT> sortProfilePoints(const std::vector<PointT> &points,
+                                      Axis longitudinal) {
+  const int uAxis = transverseAxes(longitudinal)[0];
+  std::vector<PointT> sorted = points;
+  std::sort(sorted.begin(), sorted.end(),
+            [uAxis](const PointT &lhs, const PointT &rhs) {
+              return component(lhs, uAxis) < component(rhs, uAxis);
+            });
+  return sorted;
+}
+
+// Coarse and localization profiles share the same transverse ordering.
+std::vector<ProfilePoint> makeSortedProfile(const std::vector<PointT> &sorted,
                                       Axis longitudinal,
                                       const DetectorConfig &config,
                                       float station = 0.0f,
                                       float detrendMinimumSpan = 0.0f) {
   std::vector<ProfilePoint> result;
-  if (points.size() < 5) {
+  if (sorted.size() < 5) {
     return result;
   }
 
@@ -563,12 +577,6 @@ std::vector<ProfilePoint> makeProfile(const std::vector<PointT> &points,
   // 当前 X 向扫描因此始终按 Y 排序并拟合 Z；其它纵轴也使用固定的剩余轴序。
   const int uAxis = axes[0];
   const int vAxis = axes[1];
-
-  std::vector<PointT> sorted = points;
-  std::sort(sorted.begin(), sorted.end(),
-            [uAxis](const PointT &lhs, const PointT &rhs) {
-              return component(lhs, uAxis) < component(rhs, uAxis);
-            });
 
   const float safeBinSize = std::max(0.05f, config.profileBinSize);
   std::size_t begin = 0;
@@ -601,14 +609,25 @@ std::vector<ProfilePoint> makeProfile(const std::vector<PointT> &points,
     // Theil-Sen 斜率，可去掉船体纵向陡坡，又不会受截面覆盖范围变化影响。
     if (detrendMinimumSpan > 0.0f && corrected.size() >= 3) {
       const int longitudinalAxis = static_cast<int>(longitudinal);
+      float minimum = corrected.front().data[longitudinalAxis];
+      float maximum = minimum;
+      for (const PointT &point : corrected) {
+        minimum = std::min(minimum, point.data[longitudinalAxis]);
+        maximum = std::max(maximum, point.data[longitudinalAxis]);
+      }
       std::vector<float> slopes;
-      for (std::size_t i = 0; i < corrected.size(); ++i) {
-        for (std::size_t j = i + 1; j < corrected.size(); ++j) {
-          const float delta = corrected[j].data[longitudinalAxis] -
-                              corrected[i].data[longitudinalAxis];
-          if (std::fabs(delta) >= detrendMinimumSpan) {
-            slopes.push_back(
-                (corrected[j].data[vAxis] - corrected[i].data[vAxis]) / delta);
+      // Projected frame windows have a single station. No pair can pass the
+      // span gate there; avoid an otherwise quadratic scan of every bin.
+      // Keep the original pair order whenever detrending is possible.
+      if (!(maximum - minimum < detrendMinimumSpan)) {
+        for (std::size_t i = 0; i < corrected.size(); ++i) {
+          for (std::size_t j = i + 1; j < corrected.size(); ++j) {
+            const float delta = corrected[j].data[longitudinalAxis] -
+                                corrected[i].data[longitudinalAxis];
+            if (std::fabs(delta) >= detrendMinimumSpan) {
+              slopes.push_back(
+                  (corrected[j].data[vAxis] - corrected[i].data[vAxis]) / delta);
+            }
           }
         }
       }
@@ -654,6 +673,16 @@ std::vector<ProfilePoint> makeProfile(const std::vector<PointT> &points,
     begin = end;
   }
   return result;
+}
+
+std::vector<ProfilePoint> makeProfile(const std::vector<PointT> &points,
+                                      Axis longitudinal,
+                                      const DetectorConfig &config,
+                                      float station = 0.0f,
+                                      float detrendMinimumSpan = 0.0f) {
+  if (points.size() < 5) return {};
+  return makeSortedProfile(sortProfilePoints(points, longitudinal), longitudinal,
+                           config, station, detrendMinimumSpan);
 }
 
 // S06 辅助：从交界向底面内侧逐步扩大拟合窗口。
@@ -1217,7 +1246,7 @@ public:
     }
     scoreGeometry();
     recordSurfaceFits();
-    locateBottomShape();
+    if (!retainOuterJunctions) locateBottomShape();
     if (bottomShape == ProfileBottomShape::CentralBead) {
       proposal.pair.left = candidateFromIntersection(
           profile, leftIntersection, config.longitudinalAxis, feature,
@@ -2055,7 +2084,8 @@ findSurfacePairs(const std::vector<ProfilePoint> &profile,
                  const DetectorConfig &config,
                  const std::array<HistoryPrediction, 2> &predictions,
                  std::array<ObservedWall,2> &wallTrack,
-                 bool *hasGeometry, DebugSlice *debug, bool fallbackPass = false) {
+                 bool *hasGeometry, DebugSlice *debug,
+                 detail::CandidateExecutor &executor, bool fallbackPass = false) {
   const auto previousWallTrack = wallTrack;
   const bool stableWallTurn = config.profileLocalizationMethod ==
       ProfileLocalizationMethod::CurvatureCandidates &&
@@ -2355,6 +2385,9 @@ findSurfacePairs(const std::vector<ProfilePoint> &profile,
   if (!enoughForSurfaceModel && debug)
     ++debug->gates["profile_insufficient"];
   if (enoughForSurfaceModel) {
+    // Enumerate in the original order. Independent builds write distinct slots;
+    // only the caller appends proposals, preserving tie and deduplication order.
+    std::vector<std::pair<int,int>> boundaries;
     for (int leftBoundary = sideWindow + guard;
          leftBoundary + minimumBoundaryGap + sideWindow + guard < pointCount;
          ++leftBoundary) {
@@ -2371,7 +2404,17 @@ findSurfacePairs(const std::vector<ProfilePoint> &profile,
         }
         if (debug)
           ++debug->gates["enumerated"];
-        SurfaceProposal proposal;
+        boundaries.emplace_back(leftBoundary, rightBoundary);
+      }
+    }
+    struct BuiltPair {
+      SurfaceProposal proposal, outer;
+      bool accepted = false, hasOuter = false;
+    };
+    auto buildPair = [&](std::size_t index, BuiltPair &built) {
+        const int leftBoundary = boundaries[index].first;
+        const int rightBoundary = boundaries[index].second;
+        auto &proposal = built.proposal;
         if (SurfacePairBuilder(profile, localizationProfile, config,
                                leftBoundary, rightBoundary,
                                debug, curvatures, turns, walls)
@@ -2383,22 +2426,44 @@ findSurfacePairs(const std::vector<ProfilePoint> &profile,
           // accumulate over frames and eventually pay for an artificial jump.
           // Keep only the proposal-order tie break; path costs use geometry
           // and continuity without a recurring preference for the inner branch.
-          if (directCurveLine && proposal.centralBead) {
-            SurfaceProposal outer;
+          if (proposal.centralBead) {
+            auto &outer = built.outer;
             if (SurfacePairBuilder(profile,localizationProfile,config,
                     leftBoundary,rightBoundary,debug,curvatures,turns,walls)
                     .build(outer,true) && acceptBottomSides(outer.pair)) {
               outer.cost+=.06f;
               if (outer.pair.debug) {
-                outer.pair.debug->source="curve_line_outer_alternative";
+                outer.pair.debug->source=directCurveLine ? "curve_line_outer_alternative" : "spline_outer_alternative";
                 outer.pair.debug->profileShape="ambiguous_bead";
                 outer.pair.debug->proposalCost=outer.cost;
               }
-              proposals.push_back(std::move(outer));
+              built.hasOuter = true;
             }
           }
-          proposals.push_back(std::move(proposal));
+          built.accepted = true;
         }
+    };
+    auto appendBuilt = [&](BuiltPair &built) {
+      if (built.hasOuter) proposals.push_back(std::move(built.outer));
+      if (built.accepted) proposals.push_back(std::move(built.proposal));
+    };
+    // Debug gates and callbacks retain their original single-thread ownership.
+    if (!debug && executor.parallelFor(boundaries.size())) {
+      // Keep result scratch bounded even for unusually wide/unpruned profiles.
+      std::vector<BuiltPair> built(std::min<std::size_t>(256, boundaries.size()));
+      for (std::size_t offset = 0; offset < boundaries.size(); offset += built.size()) {
+        const auto count = std::min(built.size(), boundaries.size() - offset);
+        executor.run(count, [&](std::size_t i) {
+          built[i] = BuiltPair();
+          buildPair(offset + i, built[i]);
+        });
+        for (std::size_t i = 0; i < count; ++i) appendBuilt(built[i]);
+      }
+    } else {
+      for (std::size_t i = 0; i < boundaries.size(); ++i) {
+        BuiltPair built;
+        buildPair(i, built);
+        appendBuilt(built);
       }
     }
   }
@@ -2790,6 +2855,7 @@ findSurfacePairs(const std::vector<ProfilePoint> &profile,
   if (config.useProfileCurvature && !directCurveLine && !proposals.empty()) {
     float strongestLeft=0, strongestRight=0, bestPair=0;
     for (const auto &p:proposals) {
+      if (p.centralBead) continue;
       strongestLeft=std::max(strongestLeft,std::fabs(p.pair.left.profileCurvature));
       strongestRight=std::max(strongestRight,std::fabs(p.pair.right.profileCurvature));
     }
@@ -2798,7 +2864,7 @@ findSurfacePairs(const std::vector<ProfilePoint> &profile,
       const float right=std::fabs(p.pair.right.profileCurvature)/std::max(1.e-6f,strongestRight);
       return multiCandidates ? left*right : std::min(left,right);
     };
-    for (const auto &p:proposals) bestPair=std::max(bestPair,peakSupport(p));
+    for (const auto &p:proposals) if (!p.centralBead) bestPair=std::max(bestPair,peakSupport(p));
     // Boundary hypotheses must compete against the same frame's strongest
     // supported turns. Otherwise each window can label a tiny wall ripple
     // its own "maximum". Keep comparable peaks for cross-frame selection.
@@ -2806,7 +2872,7 @@ findSurfacePairs(const std::vector<ProfilePoint> &profile,
     // either side, while retaining similarly supported alternatives for DP.
     const float minimumSupport = .8f;
     proposals.erase(std::remove_if(proposals.begin(),proposals.end(),
-        [&](const SurfaceProposal &p){return peakSupport(p)<minimumSupport*bestPair;}),proposals.end());
+        [&](const SurfaceProposal &p){return !p.centralBead && peakSupport(p)<minimumSupport*bestPair;}),proposals.end());
   }
   std::sort(proposals.begin(), proposals.end(),
             [](const SurfaceProposal &lhs, const SurfaceProposal &rhs) {
@@ -2820,7 +2886,7 @@ findSurfacePairs(const std::vector<ProfilePoint> &profile,
   for (const SurfaceProposal &proposal : proposals) {
     bool duplicate = false;
     for (const SurfacePair &existing : result) {
-      if (directCurveLine && proposal.pair.centralBead != existing.centralBead)
+      if (proposal.pair.centralBead != existing.centralBead)
         continue;
       if (transverseDistance(proposal.pair.left.point, existing.left.point,
                              config.longitudinalAxis) <
@@ -2857,7 +2923,7 @@ findSurfacePairs(const std::vector<ProfilePoint> &profile,
       debug->fittedProfile.clear(); debug->fittedCurvature.clear(); debug->turnRegions.clear();
     }
     result = findSurfacePairs(profile, localizationProfile, fallback, predictions,
-                              wallTrack, hasGeometry, debug, true);
+                              wallTrack, hasGeometry, debug, executor, true);
     for (auto &pair : result) {
       pair.left.curvatureFallback = pair.right.curvatureFallback = true;
       if (pair.debug) pair.debug->source = "curve_line_fallback/" + pair.debug->source;
@@ -3138,19 +3204,26 @@ bool prepareFrameSections(const CloudT::ConstPtr &input,
                           CloudT::Ptr &measured,
                           std::vector<ScanFrameRange> &processedFrames,
                           std::vector<FrameProjection> &projections,
-                          float &frameStep, std::string &error) {
+                          float &frameStep, std::string &error,
+                          const CloudT::ConstPtr &referenceInput = {},
+                          const std::vector<ScanFrameRange> *referenceFrames = nullptr) {
   if (!input || frames.empty()) {
     error = "No original frames were supplied.";
     return false;
   }
   std::size_t expected = 0;
   const Axis axis = config.longitudinalAxis;
+  // Acquisition geometry must not depend on which points the voxel/body masks
+  // retained. In particular, changing transverse density must not rescale the
+  // longitudinal smoothing/continuity metric or rotate the scan plane.
+  const auto &geometryInput = referenceInput ? referenceInput : input;
+  const auto &geometryFrames = referenceFrames ? *referenceFrames : frames;
   int previousId = -1;
   std::vector<float> rawStations;
-  rawStations.reserve(frames.size());
-  for (const auto &frame : frames) {
+  rawStations.reserve(geometryFrames.size());
+  for (const auto &frame : geometryFrames) {
     if (frame.begin != expected || frame.count == 0 ||
-        frame.count > input->size() - expected ||
+        expected > geometryInput->size() || frame.count > geometryInput->size() - expected ||
         frame.frameIndex <= previousId) {
       error = "Original frame ranges are incomplete or unordered.";
       return false;
@@ -3158,23 +3231,23 @@ bool prepareFrameSections(const CloudT::ConstPtr &input,
     std::vector<float> values;
     values.reserve(frame.count);
     for (std::size_t i = frame.begin; i < frame.begin + frame.count; ++i) {
-      if (!pcl::isFinite((*input)[i])) {
+      if (!pcl::isFinite((*geometryInput)[i])) {
         error = "An original frame contains a non-finite point.";
         return false;
       }
-      values.push_back(coordinate((*input)[i], axis));
+      values.push_back(coordinate((*geometryInput)[i], axis));
     }
     rawStations.push_back(median(std::move(values)));
     expected += frame.count;
     previousId = frame.frameIndex;
   }
-  if (expected != input->size()) {
+  if (expected != geometryInput->size()) {
     error = "Original frames do not cover the complete point cloud.";
     return false;
   }
   std::vector<float> pitches;
-  for (std::size_t i = 1; i < frames.size(); ++i) {
-    const int idGap = frames[i].frameIndex - frames[i - 1].frameIndex;
+  for (std::size_t i = 1; i < geometryFrames.size(); ++i) {
+    const int idGap = geometryFrames[i].frameIndex - geometryFrames[i - 1].frameIndex;
     const float pitch =
         std::fabs(rawStations[i] - rawStations[i - 1]) / float(idGap);
     if (std::isfinite(pitch) && pitch > 1.0e-4f)
@@ -3188,32 +3261,40 @@ bool prepareFrameSections(const CloudT::ConstPtr &input,
   processedFrames.reserve(frames.size());
   projections.reserve(frames.size());
   const int a = static_cast<int>(axis);
-  const int firstId = frames.front().frameIndex;
+  const int firstId = geometryFrames.front().frameIndex;
   for (std::size_t f = 0; f < frames.size(); ++f) {
     const auto &range = frames[f];
+    const auto original = std::lower_bound(geometryFrames.begin(), geometryFrames.end(), range.frameIndex,
+        [](const ScanFrameRange &r, int id) { return r.frameIndex < id; });
+    if (original == geometryFrames.end() || original->frameIndex != range.frameIndex) {
+      error = "Processed frame is missing its acquisition geometry.";
+      return false;
+    }
+    const auto originalIndex = std::size_t(original - geometryFrames.begin());
     FrameProjection projection;
     projection.frameIndex = range.frameIndex;
     projection.station = rawStations.front() +
                          frameStep * float(range.frameIndex - firstId);
-    projection.fallbackLongitudinal = rawStations[f];
+    projection.fallbackLongitudinal = rawStations[originalIndex];
     Eigen::Vector3d center = Eigen::Vector3d::Zero();
-    for (std::size_t i = range.begin; i < range.begin + range.count; ++i)
-      center += toVector((*input)[i]).cast<double>();
-    center /= double(range.count);
+    for (std::size_t i = original->begin; i < original->begin + original->count; ++i)
+      center += toVector((*geometryInput)[i]).cast<double>();
+    center /= double(original->count);
     projection.center = center.cast<float>();
     Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
     CloudT::Ptr rawFrame(new CloudT);
     rawFrame->reserve(range.count);
-    for (std::size_t i = range.begin; i < range.begin + range.count; ++i) {
+    for (std::size_t i = original->begin; i < original->begin + original->count; ++i) {
       const auto delta =
-          (toVector((*input)[i]).cast<double>() - center).eval();
+          (toVector((*geometryInput)[i]).cast<double>() - center).eval();
       covariance += delta * delta.transpose();
-      rawFrame->push_back((*input)[i]);
     }
     Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(
-        covariance / double(range.count));
+        covariance / double(original->count));
     if (solver.info() == Eigen::Success)
       projection.normal = solver.eigenvectors().col(0).cast<float>();
+    for (std::size_t i = range.begin; i < range.begin + range.count; ++i)
+      rawFrame->push_back((*input)[i]);
     CloudT::Ptr cleaned = preprocessOneFrame(rawFrame, config);
     if (!cleaned || cleaned->empty()) {
       error = "A frame became empty during preprocessing.";
@@ -3459,6 +3540,7 @@ void appendSlice(std::vector<Slice> &slices, const std::vector<PointT> &points,
                  const SeamHistory *leftHistory,
                  const SeamHistory *rightHistory, DebugTrace *debug,
                  std::array<ObservedWall,2> &wallTrack,
+                 detail::CandidateExecutor &executor,
                  const std::vector<PointT> *unmergedPoints = nullptr) {
   const int sideAxis = transverseAxes(config.longitudinalAxis)[0];
   const int requiredProfilePoints =
@@ -3482,14 +3564,15 @@ void appendSlice(std::vector<Slice> &slices, const std::vector<PointT> &points,
     return;
   }
 
+  const auto sortedPoints = sortProfilePoints(points, config.longitudinalAxis);
   const std::vector<ProfilePoint> profile =
-      makeProfile(points, config.longitudinalAxis, config, station,
+      makeSortedProfile(sortedPoints, config.longitudinalAxis, config, station,
                   config.longitudinalDetrendMinSpan);
   std::vector<ProfilePoint> localizationProfile;
   if (config.useProfileCurvature) {
     auto fineConfig=config;
     fineConfig.profileBinSize=std::min(config.profileBinSize,.25f*profileGeometryScale(config));
-    localizationProfile=makeProfile(points,config.longitudinalAxis,fineConfig,station,
+    localizationProfile=makeSortedProfile(sortedPoints,config.longitudinalAxis,fineConfig,station,
                                      config.longitudinalDetrendMinSpan);
     std::vector<ProfilePoint> cleaned;
     for (std::size_t b=0;b<localizationProfile.size();) {
@@ -3558,7 +3641,7 @@ void appendSlice(std::vector<Slice> &slices, const std::vector<PointT> &points,
     }
   }
   std::vector<SurfacePair> pairs =
-      findSurfacePairs(profile, localizationProfile, config, predictions, wallTrack, &hasGeometry, debugSlice);
+      findSurfacePairs(profile, localizationProfile, config, predictions, wallTrack, &hasGeometry, debugSlice, executor);
   publishPairStep(debug, pairs, station);
   if (pairs.empty()) {
     if (debugSlice)
@@ -3738,6 +3821,7 @@ std::vector<Slice> collectSlices(const CloudT &cloud, const StationRange &range,
   std::vector<Slice> slices;
   const float minimum = range.minimum, maximum = range.maximum;
   std::array<ObservedWall,2> wallTrack;
+  detail::CandidateExecutor executor(debug ? 1 : detail::candidateWorkerCount());
   const float halfThickness = 0.5f * config.sliceThickness;
   std::size_t total = 0;
   for (float station = minimum + halfThickness;
@@ -3761,7 +3845,7 @@ std::vector<Slice> collectSlices(const CloudT &cloud, const StationRange &range,
       publishDebugStep(debug, "S04 纵向切片 · " + std::to_string(station),
                        {{"截面原始点", pointsCloud(points)}});
     appendSlice(slices, points, station, -1, config, leftHistory,
-                rightHistory, debug, wallTrack);
+                rightHistory, debug, wallTrack, executor);
     publishFrameBatch(debug, batchBegin, false, config, debugBase, total);
   }
   publishFrameBatch(debug, batchBegin, true, config, debugBase, total);
@@ -3779,6 +3863,7 @@ collectFrameSlices(const CloudT &cloud,
   std::vector<Slice> slices;
   std::array<ObservedWall,2> wallTrack;
   const std::size_t total = frames.size();
+  detail::CandidateExecutor executor(debug ? 1 : detail::candidateWorkerCount());
   const std::size_t debugBase = debug ? debug->slices.size() : 0;
   std::size_t startOffset = total
       ? std::min<std::size_t>(std::size_t(std::max(1, config.debugStartSlice) - 1), total - 1)
@@ -3830,7 +3915,7 @@ collectFrameSlices(const CloudT &cloud,
     if (halfWindow > 0 && config.minimumFeatureDepth > 0)
       unmerged.assign(cloud.begin()+frame.begin, cloud.begin()+frame.begin+frame.count);
     appendSlice(slices, points, station, frame.frameIndex, config, leftHistory,
-                rightHistory, debug, wallTrack, unmerged.empty() ? nullptr : &unmerged);
+                rightHistory, debug, wallTrack, executor, unmerged.empty() ? nullptr : &unmerged);
     if (debug) {
       auto &debugSlice = debug->slices.back();
       debugSlice.sourceRaw.assign(measured.begin() + frame.begin,
@@ -5357,7 +5442,7 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
     // Avoid a second, centroid-generating voxel pass on the sampled cloud.
     workingConfig.voxelSize=0;
     publishDebugStep(debug,"S00 入口实测点降采样",{{"采样后点云",detectionInput}},
-        "逐帧保留实测点，主体、候选和表面提取共用此点云。",
+        "逐帧保留实测点供主体筛选与面输出；轨迹在保留单元内恢复原始轮廓。",
         {{"input_points",double(input->size())},{"sampled_points",double(detectionInput->size())}});
   }
   finishStage("input_sampling");
@@ -5410,12 +5495,28 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
   std::vector<ScanFrameRange> processedFrames;
   CloudT::Ptr measuredFrames;
   if (frameBased) {
+    // Sampling is suitable for body masking and output density, but not for
+    // deciding whether a tiny wall foot has become a different physical feature.
+    // Recover full measured detail only in accepted body cells; rejected cells
+    // and missing frames remain excluded. Surface outputs still use sourceInput.
+    InputSamplingResult detail;
+    CloudT::ConstPtr sectionInput=sourceInput;
+    const auto *sectionFrames=config.extractMainBody ? &bodyFrames : detectionFrames;
+    if (config.inputVoxelSize>0) {
+      if (config.extractMainBody) {
+        detail=recoverMeasuredFrameSupport(input,*frames,sourceInput,bodyFrames,config.inputVoxelSize);
+        if (!detail.error.empty()) {result.summary=detail.error;return result;}
+        sectionInput=detail.cloud;sectionFrames=&detail.frames;
+      } else {
+        sectionInput=input;sectionFrames=frames;
+      }
+    }
     CloudT::Ptr flattened;
     float frameStep = 1.0f;
-    if (!prepareFrameSections(sourceInput, config.extractMainBody ? bodyFrames : *detectionFrames,
+    if (!prepareFrameSections(sectionInput, *sectionFrames,
                               workingConfig, flattened, measuredFrames,
                               processedFrames, frameProjections, frameStep,
-                              result.summary))
+                              result.summary, input, frames))
       return result;
     // 帧号只替代截面生成。内部用原始帧间距估计连续性尺度，并把每帧
     // 暂时展平为一个剖面；候选、配对、路径和局部面修正仍走同一套流程。

@@ -13,4 +13,11 @@ struct InputSamplingResult {
 // A zero size returns the original cloud. No averaged coordinates are generated.
 InputSamplingResult sampleMeasuredInput(const CloudT::ConstPtr &input, float size,
                                        const std::vector<ScanFrameRange> *frames = nullptr);
+
+// Restore measured detail only inside cells retained by the sampled body mask.
+// This is a separate trajectory-support cloud, not the sampled output cloud.
+InputSamplingResult recoverMeasuredFrameSupport(
+    const CloudT::ConstPtr &input, const std::vector<ScanFrameRange> &frames,
+    const CloudT::ConstPtr &support, const std::vector<ScanFrameRange> &supportFrames,
+    float size);
 }
