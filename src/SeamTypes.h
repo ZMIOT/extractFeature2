@@ -180,8 +180,8 @@ struct DetectorConfig {
   bool mergeProfileFrames = true;
   /** @brief 原始帧合并窗口（帧）；1~101 的奇数。 @details 默认 5；有效范围 1..101。 */
   int profileMergeFrameCount = 5;
-  /** @brief 轮廓横向分箱尺寸（长度）。 @details 默认 1.2f；有效范围 0.000001..1000000000。 */
-  float profileBinSize = 1.2f;
+  /** @brief 轮廓横向分箱尺寸（长度）。 @details 默认 0.8f；有效范围 0.000001..1000000000。 */
+  float profileBinSize = 0.8f;
   /** @brief 分箱方式：0 滚动分箱、1 固定网格。 @details 默认 ProfileSamplingMode::LegacyRolling；有效范围 0..1。 */
   ProfileSamplingMode profileSamplingMode =
       ProfileSamplingMode::LegacyRolling;

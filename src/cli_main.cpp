@@ -43,7 +43,7 @@ int main(int argc, char **argv) {
         << "  --profile-merge-frames 5  --no-profile-frame-merge (original frames only)\n"
         << "  --floor-patch-size 6  --floor-patch-guard 0.6  "
            "--floor-max-correction 5\n"
-        << "  --voxel-size 0.8  --profile-bin 1.2  --floor-patch-rms 0.4\n"
+        << "  --voxel-size 0.8  --profile-bin 0.8  --floor-patch-rms 0.4\n"
         << "  --input-voxel 0.5 (measured input sampling, default 0.5, 0 disables)\n"
         << "  --profile-mode legacy-rolling|stable-grid  "
            "--profile-reference-scale 1.2\n"

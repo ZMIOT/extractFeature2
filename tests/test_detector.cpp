@@ -260,6 +260,9 @@ void testMeasuredCurvatureStep() {
       std::string(SEAM_TEST_DATA_DIR)+"/curvature_2_frames_2040_2110.txt",&error,&frames);
   require(cloud && !cloud->empty(),"Two-stage wall regression fixture is missing");
   auto c=weld::AlgorithmParameters().get(weld::ProfileLocalizationMethod::CurvatureCandidates);
+  // This measured two-stage-wall regression was calibrated at 1.2 mm. Its
+  // exact candidate-count and width assertions depend on that sampling scale.
+  c.profileBinSize=1.2f;
   c.extractMainBody=false; c.voxelSize=0; c.outlierMeanK=0;
   c.trimUnstableEndpoints=false; c.finalSmoothingEnabled=false;
   weld::DebugTrace trace;
@@ -1194,6 +1197,9 @@ void testNarrowWallSpikes() {
     fixture.frames.push_back({begin,fixture.cloud->size()-begin,frame});
   }
   weld::DetectorConfig config;
+  // Keep the measured spike/short-gap fixture at its original sampling scale;
+  // rolling-bin width also determines the physical spike-filter neighborhood.
+  config.profileBinSize=1.2f;
   config.extractMainBody=false; config.voxelSize=0; config.outlierMeanK=0;
   config.useSurfaceRefinement=false; config.trimUnstableEndpoints=false;
   config.adaptiveSeamCount=false;
