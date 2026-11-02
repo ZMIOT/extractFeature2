@@ -69,8 +69,21 @@ int main(int argc, char **argv) {
       config.profileWallTolerance=std::stof(argv[++i]);
   }
   weld::DebugTrace trace;
+  bool summaryOnly=false;
+  for(int i=7;i<argc;++i)summaryOnly=summaryOnly || std::string(argv[i])=="--summary-only";
   const auto start = std::chrono::steady_clock::now();
-  const auto result = weld::SeamDetector().detect(input, config, nullptr, nullptr, &trace, &frames);
+  const auto result = weld::SeamDetector().detect(input, config, nullptr, nullptr, summaryOnly?nullptr:&trace, &frames);
+  if(summaryOnly) {
+    std::ofstream report(std::string(argv[2])+"_report.txt");
+    report<<result.summary<<'\n';
+    for(int side=0;side<2;++side) {
+      const auto &ids=side?result.rightFrameIndices:result.leftFrameIndices;
+      if(!ids.empty())report<<(side?"right":"left")<<"_frames,"<<ids.front()<<','<<ids.back()<<','<<ids.size()<<'\n';
+    }
+    if(result.ok())weld::PointCloudIO::saveFrameSeamCsv(std::string(argv[2])+"_seams.csv",result,&error);
+    std::cout<<result.summary<<'\n';
+    return result.ok()?0:5;
+  }
   for (int i=7;i+3<argc;++i) if (std::string(argv[i])=="--export-frames") {
     const int first=std::stoi(argv[i+1]), last=std::stoi(argv[i+2]);
     std::ofstream fixture(argv[i+3]);
@@ -158,6 +171,7 @@ int main(int argc, char **argv) {
     for(const auto&p:trace.selectedPath[side])dump("candidate",side,p);
     for(const auto&p:trace.interpolatedPath[side])dump("interpolated",side,p);
     for(const auto&p:trace.beforeWallPath[side])dump("regularized",side,p);
+    for(const auto&p:trace.measuredWallFeet[side])dump("measured_foot",side,p);
   }
   std::ofstream walls(base+"_walls.csv");
   walls<<"side,station,normal_u,normal_v,offset,rms,status,method\n";

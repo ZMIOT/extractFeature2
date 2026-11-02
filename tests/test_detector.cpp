@@ -1389,6 +1389,8 @@ void testBottomShapeClassification() {
   for (std::size_t i = 0; i < bead.first.leftSeam->size(); ++i) {
     const float left = (*bead.first.leftSeam)[i].y;
     const float right = (*bead.first.rightSeam)[i].y;
+    if(!(left < -1.f && left > -9.f && right > 1.f && right < 9.f))
+      std::cerr<<"Unexpected bead point "<<i<<" L/R="<<left<<"/"<<right<<'\n';
     require(left < -1.f && left > -9.f && right > 1.f && right < 9.f,
             "Central bead did not select the two adjacent valley regions");
   }
@@ -1453,13 +1455,14 @@ void testEmergingEndpointTrim() {
               trimmed.leftFrameIndices.front()==uncut.leftFrameIndices.front(),
               "Straight shallow onset was removed merely for using fallback candidates");
     }
-    require(trimmed.leftFrameIndices==trimmed.rightFrameIndices,
-            "Emerging endpoint trim desynchronized left and right frames");
-    for (std::size_t i=0;i<trimmed.leftSeam->size();++i) {
-      const auto source=i+trimmed.endpointTrimmedStart;
-      require((weld::toVector((*trimmed.leftSeam)[i])-weld::toVector((*uncut.leftSeam)[source])).norm()==0 &&
-              (weld::toVector((*trimmed.rightSeam)[i])-weld::toVector((*uncut.rightSeam)[source])).norm()==0,
-              "Emerging endpoint trim moved retained measured coordinates");
+    for(int side=0;side<2;++side) {
+      const auto &kept=side?*trimmed.rightSeam:*trimmed.leftSeam;
+      const auto &before=side?*uncut.rightSeam:*uncut.leftSeam;
+      const auto &ids=side?trimmed.rightFrameIndices:trimmed.leftFrameIndices;
+      require(ids.size()==kept.size(),"Independent trim lost frame IDs");
+      for(std::size_t i=0;i<kept.size();++i)
+        require((weld::toVector(kept[i])-weld::toVector(before[i+trimmed.sideEndpointTrimmedStart[side]])).norm()==0,
+                "Emerging endpoint trim moved retained measured coordinates");
     }
   }
 }
@@ -1498,9 +1501,9 @@ void testEndpointTrim() {
   require(bent.endpointTrimmedStart>0 && bent.endpointTrimmedEnd>0,"Large hooks survived endpoint trimming");
   require(bent.leftSeam->front().x>=15 && bent.leftSeam->front().x<=28 &&
           bent.leftSeam->back().x>=172 && bent.leftSeam->back().x<=185,"Endpoint cut missed the known bend onset");
-  require(bent.leftFrameIndices==bent.rightFrameIndices && bent.leftSeam->size()==bent.rightSeam->size() &&
-          bent.leftPointQuality.size()==bent.leftSeam->size() && bent.rightPointConfidence.size()==bent.leftSeam->size(),
-          "Paired endpoint trimming lost aligned IDs or metadata");
+  require(bent.rightSeam->size()==401 && bent.rightFrameIndices.front()==1000 && bent.rightFrameIndices.back()==1400 &&
+          bent.leftPointQuality.size()==bent.leftSeam->size() && bent.rightPointConfidence.size()==bent.rightSeam->size(),
+          "A left hook trimmed the stable right track or lost metadata");
   require(bent.leftSegmentStarts==std::vector<std::size_t>({0,200-bent.endpointTrimmedStart}),"Trimming lost an interior segment break");
   for (std::size_t i=0;i<bent.leftSeam->size();++i)
     require((weld::toVector((*bent.leftSeam)[i])-weld::toVector(original[i+bent.endpointTrimmedStart])).norm()==0,
@@ -1557,11 +1560,8 @@ void testSingleEndpointTrim() {
   const auto decision=weld::classifySeamWidth(stable,config);
   require(decision.mode==1 && decision.singleVotes>decision.doubleVotes,"Single endpoint fixture mode wrong");
   weld::trimSeamEndpoints(stable,config,nullptr,&decision);
-  require(stable.endpointTrimmedStart==0 && stable.endpointTrimmedEnd==0 && stable.leftSeam->size()==401,
-          "Changing groove width truncated a stable single centerline");
-  weld::applySeamWidthRule(stable,config,&decision);
-  require(stable.centerSeam->size()==401 && stable.centerFrameIndices.back()==1400,
-          "Stable single endpoint or IDs were lost");
+  require(stable.endpointTrimmedStart==0 && stable.endpointTrimmedEnd>0,
+          "Width classification overrode independent wall endpoint trimming");
   auto dual=make(false); auto dualConfig=config; dualConfig.adaptiveSeamCount=false;
   weld::trimSeamEndpoints(dual,dualConfig);
   require(dual.endpointTrimmedEnd>0,"Double-track wall bend no longer triggers endpoint trimming");
@@ -1569,10 +1569,10 @@ void testSingleEndpointTrim() {
   const weld::CloudT left(*bent.leftSeam),right(*bent.rightSeam);
   const auto bentDecision=weld::classifySeamWidth(bent,config);
   weld::trimSeamEndpoints(bent,config,nullptr,&bentDecision);
-  require(bent.endpointTrimmedEnd>0 && bent.leftSeam->back().x>=170 && bent.leftSeam->back().x<=185,
-          "A genuine single centerline tail bend survived or was cut at the wall flare");
-  require(bent.leftFrameIndices==bent.rightFrameIndices && bent.leftPointQuality.size()==bent.leftSeam->size(),
-          "Single endpoint trim lost paired metadata");
+  require(bent.sideEndpointTrimmedEnd[0]>0 && bent.sideEndpointTrimmedEnd[1]>0,
+          "Independent wall bends survived endpoint trimming");
+  require(bent.leftPointQuality.size()==bent.leftSeam->size() && bent.rightPointQuality.size()==bent.rightSeam->size(),
+          "Independent endpoint trim lost metadata");
   weld::applySeamWidthRule(bent,config,&bentDecision);
   for (std::size_t i=0;i<bent.centerSeam->size();++i) {
     const auto index=std::size_t(bent.centerFrameIndices[i]-1000);

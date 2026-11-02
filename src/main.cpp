@@ -17,6 +17,10 @@
 #include <vtkRenderer.h>
 #include <vtkRendererCollection.h>
 #include <vtkActorCollection.h>
+#include <vtkActor.h>
+#include <vtkMapper.h>
+#include <vtkPolyData.h>
+#include <vtkProperty.h>
 #include <cstdio>
 #include <cstring>
 
@@ -214,6 +218,36 @@ int main(int argc, char **argv) {
                            const auto restored=renderer->GetActors()->GetNumberOfItems();
                            if(hidden!=before-1 || restored!=before)layersOk=false;
                            std::fprintf(stderr,"Surface toggle %s: actors %d -> %d -> %d\n",name,before,hidden,restored);
+                         }
+                         if(layersOk && window.findChild<QCheckBox *>("generateSurfaceModels")->isChecked()) {
+                           auto countMeshes=[&] {
+                             int count=0;auto *actors=renderer->GetActors();actors->InitTraversal();
+                             while(auto *actor=actors->GetNextActor()) {
+                               auto *poly=actor->GetMapper()?vtkPolyData::SafeDownCast(actor->GetMapper()->GetInput()):nullptr;
+                               if(poly && poly->GetNumberOfPolys()>0) {
+                                 ++count;
+                                 const auto *color=actor->GetProperty()->GetColor();
+                                 const bool blue=std::abs(color[0]-60/255.)<1.e-6 && std::abs(color[2]-245/255.)<1.e-6;
+                                 const bool orange=std::abs(color[0]-245/255.)<1.e-6 && std::abs(color[2]-45/255.)<1.e-6;
+                                 const bool green=std::abs(color[0]-55/255.)<1.e-6 && std::abs(color[1]-195/255.)<1.e-6;
+                                 if(!blue && !orange && !green)layersOk=false;
+                               }
+                             }
+                             return count;
+                           };
+                           auto *meshes=window.findChild<QCheckBox *>("showFittedSurfaces");
+                           auto *points=window.findChild<QCheckBox *>("showSurfacePoints");
+                           const int before=countMeshes();
+                           if(!meshes || !points || before==0)layersOk=false;
+                           else {
+                             meshes->setChecked(false);
+                             if(countMeshes()!=0)layersOk=false;
+                             points->setChecked(true);
+                             if(countMeshes()!=0)layersOk=false;
+                             points->setChecked(false);meshes->setChecked(true);
+                             if(countMeshes()!=before)layersOk=false;
+                             std::fprintf(stderr,"B-spline triangle mesh toggle: %d -> 0 -> %d\n",before,countMeshes());
+                           }
                          }
                          for (auto *scroll : window.findChildren<QScrollArea *>()) {
                            scroll->verticalScrollBar()->setValue(0);

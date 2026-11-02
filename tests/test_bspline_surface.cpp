@@ -10,6 +10,7 @@ void curvedTest(weld::Axis axis,bool vertical,bool framed,bool gaps) {
   weld::CloudT input;std::vector<weld::SurfaceSection> sections;
   std::vector<std::vector<std::size_t>> groups;std::vector<unsigned char> labels;
   weld::DetectorConfig config;config.longitudinalAxis=axis;config.sliceStep=1;
+  config.profileCurvatureRadius=4;
   const int a=int(axis),b=a==0?1:0,c=a==2?1:2;
   // Nonplanar surface, with reversed/tilted scans and a large world translation.
   auto point=[&](double x,double y) {
@@ -79,11 +80,74 @@ void noisyBoundaryTest() {
     Eigen::Vector3d p;
     require(patch.evaluate(.5,.5,p) && std::abs(p.z())<.05,"Noise/outliers displaced fitted plane");
   }
-  // A missing side in a present frame must split this face independently.
+  for(std::size_t i=1;i<model.patches.size();++i) {
+    const auto &a=model.patches[i-1],&b=model.patches[i];
+    if(a.lastFrame!=b.firstFrame)continue;
+    for(int j=0;j<=100;++j) {
+      Eigen::Vector3d p,q;
+      require(a.evaluate(1,j/100.,p) && b.evaluate(0,j/100.,q) && (p-q).norm()<1.e-8,
+              "Adjacent fitted subdivisions have a crack");
+    }
+  }
+  // An explicitly invalid face must still split independently.
   for(auto index:groups[10])labels[index]=2;
+  sections[10].leftValid=false;
   const auto missing=weld::fitSurfaceModel(cloud,groups,sections,labels,1,config);
   for(const auto &patch:missing.patches)
     require(!(patch.firstFrame<10 && patch.lastFrame>10),"Missing side was bridged");
+}
+void holesTest(bool framed,bool vertical) {
+  weld::CloudT cloud;std::vector<weld::SurfaceSection> sections;
+  std::vector<std::vector<std::size_t>> groups;std::vector<unsigned char> labels;
+  weld::DetectorConfig config;config.sliceStep=1;config.profileCurvatureRadius=4;
+  for(int r=0;r<32;++r) {
+    if(r==18 || r==19)continue; // absent scan identities
+    weld::SurfaceSection s;s.station=float(r);s.frameIndex=framed?r:-1;
+    sections.push_back(s);groups.emplace_back();
+    if(r==8 || r==9)continue; // whole missing face in present scans
+    for(int j=0;j<=80;++j) {
+      if(r>=12 && r<=16 && j>=30 && j<=50)continue;
+      const float y=.125f*j,h=.001f*r*r+.01f*y*y;
+      groups.back().push_back(cloud.size());labels.push_back(1);
+      cloud.push_back({framed?-float(r)+.12f*y:float(r),vertical?h:y,vertical?y:h});
+    }
+  }
+  const auto model=weld::fitSurfaceModel(cloud,groups,sections,labels,1,config);
+  require(model.patches.size()==1,"Small supported holes split the fitted face");
+  require(model.patches.front().sampleCount==cloud.size(),"Synthetic constraints polluted measured sample count");
+  for(int i=0;i<=80;++i)for(int j=0;j<=20;++j) {
+    Eigen::Vector3d p,n;
+    require(model.evaluate(0,i/80.,j/20.,p,&n),"Hole repair produced a singular surface");
+    const double y=vertical?p.z():p.y(),h=vertical?p.y():p.z();
+    const double x=framed?-p.x()+.12*y:p.x();
+    require(std::abs(h-.001*x*x-.01*y*y)<.08,"Hole interpolation left the measured surface");
+  }
+  for(std::size_t i=0;i<sections.size();++i)if(sections[i].station>=23 && sections[i].station<=28)
+    for(auto index:groups[i])labels[index]=0;
+  const auto large=weld::fitSurfaceModel(cloud,groups,sections,labels,1,config);
+  for(const auto &patch:large.patches)
+    require(!(patch.firstStation<23 && patch.lastStation>28),"Large unsupported gap was filled");
+}
+void denseFrameHoleTest() {
+  weld::CloudT cloud;std::vector<weld::SurfaceSection> sections;
+  std::vector<std::vector<std::size_t>> groups;std::vector<unsigned char> labels;
+  weld::DetectorConfig config;config.sliceStep=.25f;config.profileCurvatureRadius=8;
+  for(int r=0;r<96;++r) {
+    weld::SurfaceSection section;section.station=.25f*r;section.frameIndex=r;
+    sections.push_back(section);groups.emplace_back();
+    if(r>=35 && r<=52)continue;
+    for(int j=0;j<=40;++j) {
+      groups.back().push_back(cloud.size());labels.push_back(1);
+      cloud.push_back({section.station,.25f*j,.001f*section.station*section.station});
+    }
+  }
+  const auto model=weld::fitSurfaceModel(cloud,groups,sections,labels,1,config);
+  require(model.patches.size()==1,"Dense scan hole was split by frame count instead of physical distance");
+  for(int i=0;i<=100;++i) {
+    Eigen::Vector3d p,n;
+    require(model.evaluate(0,i/100.,.5,p,&n) && std::abs(p.z()-.001*p.x()*p.x())<.03,
+            "Physical-neighborhood repair changed surface shape");
+  }
 }
 }
 int main() {
@@ -92,6 +156,8 @@ int main() {
       for(bool vertical:{false,true})for(bool framed:{false,true})curvedTest(axis,vertical,framed,true);
     curvedTest(weld::Axis::X,false,false,false);
     noisyBoundaryTest();
+    for(bool framed:{false,true})for(bool vertical:{false,true})holesTest(framed,vertical);
+    denseFrameHoleTest();
     std::cout<<"B-spline analytic geometry, normals, gaps, reversed tilted scans, vertical walls and invalid input passed.\n";
     return 0;
   }catch(const std::exception &e){std::cerr<<e.what()<<'\n';return 1;}

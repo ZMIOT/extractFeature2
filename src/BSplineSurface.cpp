@@ -1,6 +1,7 @@
 #include "SurfaceFitting.h"
 #include <Eigen/Eigenvalues>
 #include <Eigen/SparseCholesky>
+#include <Eigen/Cholesky>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -65,7 +66,7 @@ struct Row {
   std::vector<Eigen::Vector3d> points;
   std::vector<double> arc;
   Eigen::Vector3d center=Eigen::Vector3d::Zero();
-  double u=0;
+  double u=0,contourLength=0;
 };
 Eigen::Vector3d interpolate(const Row &row,double t) {
   const auto it=std::lower_bound(row.arc.begin(),row.arc.end(),t);
@@ -97,25 +98,29 @@ bool fitRun(std::vector<Row> &rows,const std::vector<SurfaceSection> &sections,
   double maximumWidth=0;
   for(std::size_t r=0;r<rows.size();++r) {
     auto &row=rows[r];
-    auto projection=[&](const Eigen::Vector3d &p){return direction[0]*p[b]+direction[1]*p[c];};
-    std::sort(row.points.begin(),row.points.end(),[&](const Eigen::Vector3d &p,const Eigen::Vector3d &q){
-      const double x=projection(p),y=projection(q);
-      if(x!=y)return x<y;
-      for(int k=0;k<3;++k)if(p[k]!=q[k])return p[k]<q[k];
-      return false;
-    });
-    row.points.erase(std::unique(row.points.begin(),row.points.end(),
-        [](const Eigen::Vector3d &p,const Eigen::Vector3d &q){return (p-q).squaredNorm()<1e-16;}),row.points.end());
-    if(row.points.size()<4)return false;
-    // Chord-length parameterization in the section plane. Original XYZ is fitted.
-    row.arc.assign(row.points.size(),0);
-    for(std::size_t j=1;j<row.points.size();++j) {
-      const auto d=row.points[j]-row.points[j-1];
-      row.arc[j]=row.arc[j-1]+std::hypot(d[b],d[c]);
+    // Recursive subdivisions inherit the parent's contour ordering. Otherwise
+    // a changing PCA direction could parameterize their shared edge oppositely.
+    if(row.arc.empty()) {
+      auto projection=[&](const Eigen::Vector3d &p){return direction[0]*p[b]+direction[1]*p[c];};
+      std::sort(row.points.begin(),row.points.end(),[&](const Eigen::Vector3d &p,const Eigen::Vector3d &q){
+        const double x=projection(p),y=projection(q);
+        if(x!=y)return x<y;
+        for(int k=0;k<3;++k)if(p[k]!=q[k])return p[k]<q[k];
+        return false;
+      });
+      row.points.erase(std::unique(row.points.begin(),row.points.end(),
+          [](const Eigen::Vector3d &p,const Eigen::Vector3d &q){return (p-q).squaredNorm()<1e-16;}),row.points.end());
+      if(row.points.size()<4)return false;
+      // Chord-length parameterization in the section plane. Original XYZ is fitted.
+      row.arc.assign(row.points.size(),0);
+      for(std::size_t j=1;j<row.points.size();++j) {
+        const auto d=row.points[j]-row.points[j-1];
+        row.arc[j]=row.arc[j-1]+std::hypot(d[b],d[c]);
+      }
+      if(row.arc.back()<1e-6)return false;
+      row.contourLength=row.arc.back();for(auto &t:row.arc)t/=row.contourLength;
     }
-    if(row.arc.back()<1e-6)return false;
-    maximumWidth=std::max(maximumWidth,row.arc.back());
-    const double length=row.arc.back();for(auto &t:row.arc)t/=length;
+    maximumWidth=std::max(maximumWidth,row.contourLength);
     if(r) {
       // Transverse variation of a cropped wall must not invent longitudinal support.
       const double step=(row.center-rows[r-1].center).norm();
@@ -136,32 +141,75 @@ bool fitRun(std::vector<Row> &rows,const std::vector<SurfaceSection> &sections,
   if(rank.info()!=Eigen::Success || rank.eigenvalues()[1]<1e-10*rank.eigenvalues()[2])return false;
   const double spacing=std::max(1.,8.*config.profileBinSize);
   out.countU=std::min(int(rows.size()),std::max(4,std::min(32,int(std::ceil(length/spacing))+3)));
-  out.countV=std::max(4,std::min(12,int(std::ceil(maximumWidth/spacing))+3));
+  // All subdivisions share the same transverse basis and boundary curves.
+  out.countV=12;
   out.knotsU=makeKnots(out.countU);out.knotsV=makeKnots(out.countV);
-  struct Sample {std::vector<std::pair<int,double>> weights;Eigen::Vector3d p;double robust=1;};
+  struct Sample {std::vector<std::pair<int,double>> weights;Eigen::Vector3d p;double robust=1,confidence=1;};
   std::vector<Sample> samples;
-  const int rowCount=std::min(256,int(rows.size())),columnCount=48,controlCount=out.countU*out.countV;
-  for(int r=0;r<rowCount;++r) {
-    const auto &row=rows[std::size_t(r)*(rows.size()-1)/(rowCount-1)];
-    const auto bu=basis(out.knotsU,3,row.u);
-    for(int k=0;k<columnCount;++k) {
-      const double v=double(k)/(columnCount-1);const auto bv=basis(out.knotsV,3,v);
-      Sample s;s.p=interpolate(row,v)-mean;
+  const int columnCount=std::max(48,std::min(192,int(std::ceil(maximumWidth/std::max(.1f,config.profileBinSize)))+1));
+  const int controlCount=out.countU*out.countV;
+  auto addSample=[&](double u,double v,const Eigen::Vector3d &p,double confidence) {
+      const auto bu=basis(out.knotsU,3,u),bv=basis(out.knotsV,3,v);
+      Sample s;s.p=p-mean;s.confidence=confidence;s.robust=confidence;
       for(int i=0;i<out.countU;++i)if(bu[i]>0)
         for(int j=0;j<out.countV;++j)if(bv[j]>0)s.weights.emplace_back(i*out.countV+j,bu[i]*bv[j]);
       samples.push_back(std::move(s));
+  };
+  for(std::size_t r=0;r<rows.size();++r) {
+    const auto &row=rows[r];
+    for(int k=0;k<columnCount;++k) {
+      const double v=double(k)/(columnCount-1);
+      addSample(row.u,v,interpolate(row,v),1);
+    }
+    // Missing interior scans get low-weight constraints from both neighboring
+    // measured contours. No endpoint extrapolation; large gaps split below.
+    if(r) {
+      const auto &previous=rows[r-1];
+      const auto &a=sections[previous.section],&b=sections[row.section];
+      const int steps=std::max(1,std::min(64,
+          int(std::lround((b.station-a.station)/config.sliceStep))));
+      for(int step=1;step<steps;++step)for(int k=0;k<columnCount;++k) {
+        const double t=double(step)/steps,v=double(k)/(columnCount-1);
+        addSample((1-t)*previous.u+t*row.u,v,
+            (1-t)*interpolate(previous,v)+t*interpolate(row,v),.25);
+      }
     }
   }
+  // Fit each measured edge independently of the patch interior. Fixing these
+  // controls makes adjacent subdivisions exactly C0 continuous (same v).
+  Eigen::MatrixXd boundary=Eigen::MatrixXd::Zero(controlCount,3);
+  for(int end=0;end<2;++end) {
+    const auto &row=end?rows.back():rows.front();
+    Eigen::MatrixXd matrix=Eigen::MatrixXd::Identity(out.countV,out.countV)*1.e-9;
+    Eigen::MatrixXd rhs=Eigen::MatrixXd::Zero(out.countV,3);
+    for(int k=0;k<192;++k) {
+      const double v=double(k)/191;
+      const auto bv=basis(out.knotsV,3,v);
+      const Eigen::Vector3d p=interpolate(row,v)-row.points.front();
+      for(int i=0;i<out.countV;++i) {
+        rhs.row(i)+=bv[i]*p.transpose();
+        for(int j=0;j<out.countV;++j)matrix(i,j)+=bv[i]*bv[j];
+      }
+    }
+    const Eigen::MatrixXd edge=matrix.ldlt().solve(rhs);
+    const int offset=end?(out.countU-1)*out.countV:0;
+    for(int j=0;j<out.countV;++j)
+      boundary.row(offset+j)=edge.row(j)+(row.points.front()-mean).transpose();
+  }
+  auto fixed=[&](int index){return index<out.countV || index>=(out.countU-1)*out.countV;};
   Eigen::MatrixXd controls;
   const double robustScale=std::max(.01,double(std::max(config.profileWallTolerance,config.hullSurfaceDistance)));
   const double smoothness=1e-4*samples.size()/controlCount;
   for(int iteration=0;iteration<3;++iteration) {
-    std::vector<Eigen::Triplet<double>> terms;terms.reserve(samples.size()*256+controlCount*20);
+    std::vector<Eigen::Triplet<double>> terms;terms.reserve(controlCount*controlCount+controlCount*20);
+    Eigen::MatrixXd normal=Eigen::MatrixXd::Zero(controlCount,controlCount);
     Eigen::MatrixXd rhs=Eigen::MatrixXd::Zero(controlCount,3);
     for(const auto &s:samples)for(const auto &x:s.weights) {
       rhs.row(x.first)+=s.robust*x.second*s.p.transpose();
-      for(const auto &y:s.weights)terms.emplace_back(x.first,y.first,s.robust*x.second*y.second);
+      for(const auto &y:s.weights)normal(x.first,y.first)+=s.robust*x.second*y.second;
     }
+    for(int i=0;i<controlCount;++i)for(int j=0;j<controlCount;++j)
+      if(normal(i,j)!=0)terms.emplace_back(i,j,normal(i,j));
     auto smooth=[&](int i,int j,int k) {
       const int ids[]={i,j,k};const double w[]={1,-2,1};
       for(int x=0;x<3;++x)for(int y=0;y<3;++y)terms.emplace_back(ids[x],ids[y],smoothness*w[x]*w[y]);
@@ -172,7 +220,16 @@ bool fitRun(std::vector<Row> &rows,const std::vector<SurfaceSection> &sections,
       if(j+2<out.countV)smooth(index,index+1,index+2);
       terms.emplace_back(index,index,1e-10);
     }
-    Eigen::SparseMatrix<double> matrix(controlCount,controlCount);matrix.setFromTriplets(terms.begin(),terms.end());
+    std::vector<Eigen::Triplet<double>> freeTerms;freeTerms.reserve(terms.size());
+    for(const auto &term:terms) {
+      if(fixed(term.row()))continue;
+      if(fixed(term.col()))rhs.row(term.row())-=term.value()*boundary.row(term.col());
+      else freeTerms.push_back(term);
+    }
+    for(int i=0;i<controlCount;++i)if(fixed(i)) {
+      freeTerms.emplace_back(i,i,1);rhs.row(i)=boundary.row(i);
+    }
+    Eigen::SparseMatrix<double> matrix(controlCount,controlCount);matrix.setFromTriplets(freeTerms.begin(),freeTerms.end());
     Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;solver.compute(matrix);
     if(solver.info()!=Eigen::Success)return false;
     controls=solver.solve(rhs);
@@ -180,7 +237,7 @@ bool fitRun(std::vector<Row> &rows,const std::vector<SurfaceSection> &sections,
     for(auto &s:samples) {
       Eigen::Vector3d fitted=Eigen::Vector3d::Zero();
       for(const auto &x:s.weights)fitted+=x.second*controls.row(x.first).transpose();
-      s.robust=std::min(1.,robustScale/std::max(1e-12,(fitted-s.p).norm()));
+      s.robust=s.confidence*std::min(1.,robustScale/std::max(1e-12,(fitted-s.p).norm()));
     }
   }
   out.controlPoints.resize(controlCount);
@@ -237,8 +294,7 @@ BSplineSurfaceModel fitSurfaceModel(const CloudT &source,
     if(fitRun(part,sections,config,patch))model.patches.push_back(std::move(patch));
     else if(patch.valid() && part.size()>=7) {
       // A rapidly changing boundary can defeat one long chart. Subdivide at
-      // a measured section, sharing that section but imposing no artificial
-      // continuity across independently fitted patches.
+      // a measured section. Both children use its identical fixed edge curve.
       const auto middle=part.size()/2;
       fitPart(std::vector<Row>(part.begin(),part.begin()+middle+1));
       fitPart(std::vector<Row>(part.begin()+middle,part.end()));
@@ -250,15 +306,21 @@ BSplineSurfaceModel fitSurfaceModel(const CloudT &source,
     rows.clear();
   };
   for(std::size_t i=0;i<sections.size();++i) {
+    const auto &section=sections[i];
+    if((face==1 && !section.leftValid) || (face==2 && !section.rightValid) ||
+       (face==3 && !section.leftValid && !section.rightValid)) {flush();continue;}
     Row row;row.section=i;
     for(auto index:groups[i])if(labels[index]==face)row.points.push_back(toVector(source[index]).cast<double>());
     if(!rows.empty()) {
       const auto &previous=sections[rows.back().section],&current=sections[i];
-      const bool gap=current.frameIndex>=0 ? current.frameIndex!=previous.frameIndex+1 :
-          current.station-previous.station>1.5*config.sliceStep;
+      // Use physical neighborhood size, not a fixed frame count: dense scans
+      // can have many missing frames inside a small, repairable hole.
+      const double maximumGap=std::max(4.5*config.sliceStep,double(config.profileCurvatureRadius));
+      const bool gap=current.station<=previous.station || current.station-previous.station>maximumGap ||
+          (current.frameIndex>=0 && current.frameIndex<=previous.frameIndex);
       if(gap)flush();
     }
-    if(row.points.size()<4){flush();continue;}
+    if(row.points.size()<4)continue;
     rows.push_back(std::move(row));
   }
   flush();

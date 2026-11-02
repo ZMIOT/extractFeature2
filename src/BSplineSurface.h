@@ -10,7 +10,8 @@ namespace weld {
  * S(u,v) = sum N_i,degreeU(u) N_j,degreeV(v) controlPoints[i*countV+j].
  * Clamped full knot vectors (including all endpoint repetitions), u,v in [0,1].
  * u follows scan order; v follows the measured cross-section contour.
- * Each patch has independent parameters; never connect separate patches.
+ * Subdivisions sharing a measured edge use the same boundary curve (C0).
+ * Never connect patches across unsupported gaps.
  */
 struct BSplineSurfacePatch {
   int degreeU = 3, degreeV = 3;
@@ -29,7 +30,8 @@ struct BSplineSurfacePatch {
                 Eigen::Vector3d *normal = nullptr) const;
 };
 
-/** One named face; gaps or missing face support split it into separate patches.
+/** One named face; short interior holes use neighboring measured support.
+ * Long gaps or explicitly invalid face boundaries split it into separate patches.
  * A valid model may cover only part of the measured face. rejectedPatchCount
  * counts runs lacking sufficient 2-D support or failing fitting/quality checks.
  */

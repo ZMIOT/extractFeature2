@@ -52,7 +52,8 @@ enum SeamQualityFlag : std::uint32_t {
   QualityPairConstraintLimited = 1u << 6,
   QualityFinalCurveSmoothed = 1u << 7,
   QualityCurvatureFallback = 1u << 8,
-  QualityUniformWidth = 1u << 9
+  QualityUniformWidth = 1u << 9,
+  QualityMeasuredWallFoot = 1u << 10
 };
 
 // 原始输入中的连续帧范围；保留真实帧号，不根据坐标或点距猜帧。
@@ -159,7 +160,7 @@ struct DetectorConfig {
   // 所有长度参数都使用点云自身单位；当前样例数据按毫米设置默认值。
   /** @brief 预处理体素边长（长度）；0 禁用体素降采样。 @details 默认 0.8f；有效范围 0..1000000000。 */
   float voxelSize = 0.8f;
-  /** @brief 实测点体素采样；默认 0.5，0 关闭。有帧号时用于主体筛选及面输出，轨迹恢复保留单元内的原始轮廓，帧几何由原始帧确定；无帧号时各阶段使用采样点。 */
+  /** @brief 实测点体素采样；默认 0.5，0 关闭。主体分析使用采样点，面提取恢复主体保留单元内的原始密集点；有帧号的轨迹也恢复原始轮廓，帧几何由原始帧确定。 */
   float inputVoxelSize = 0.5f;
   /** @brief 统计离群滤波邻居数（点）；0 禁用。 @details 默认 12；有效范围 0..100000。 */
   int outlierMeanK = 12;
@@ -363,6 +364,8 @@ struct DetectorConfig {
   // Walk outward from the central reference span and stop at sustained bends/jumps.
   /** @brief 截去两端持续不稳定的轨迹。 @details 默认 true；有效范围 true/false。 */
   bool trimUnstableEndpoints = true;
+  // Stop each side face at its own trajectory end; close the floor between ends.
+  bool limitSurfaceEndsToTracks = true;
   /** @brief 端点截断检查窗口（长度）。 @details 默认 12.0f；有效范围 0.000001..1000000000。 */
   float endpointTrimWindow = 12.0f;
   /** @brief 端点持续弯折阈值（度）。 @details 默认 20.0f；有效范围 0.000001..89.9999。 */
@@ -474,7 +477,8 @@ struct SeamResult {
   /// @brief 超过候选修正约束而拒绝的点数。
   std::size_t candidateCorrectionRejected = 0;
   /// @brief 首部/尾部截去的站位数。
-  std::size_t endpointTrimmedStart = 0, endpointTrimmedEnd = 0;
+  std::size_t endpointTrimmedStart = 0, endpointTrimmedEnd = 0; // Legacy left-side counters; see per-side arrays below.
+  std::array<std::size_t,2> sideEndpointTrimmedStart{{0,0}}, sideEndpointTrimmedEnd{{0,0}};
   /// @brief 主体提取后的实测点云。
   CloudT::Ptr mainBodyCloud{new CloudT};
   /// @brief 左侧壁实测 XYZ 点云；原始坐标和输入顺序，不含拟合生成点。
@@ -483,7 +487,7 @@ struct SeamResult {
   CloudT::Ptr rightSurface{new CloudT};
   /// @brief 左右侧壁拟合面之间的焊道面实测 XYZ 点云（不是中心轨迹）。
   CloudT::Ptr weldSurface{new CloudT};
-  /// @brief 三次 B 样条曲面；独立曲面片对应连续支撑区段，缺口不相连。
+  /// @brief 三次 B 样条曲面；短缺测区按邻域补点，细分片共边，长缺口保持分片。
   BSplineSurfaceModel leftSurfaceModel, weldSurfaceModel, rightSurfaceModel;
   /// @brief 主体提取移除的输入点数。
   std::size_t removedBodyPoints = 0;
@@ -533,11 +537,11 @@ struct SeamResult {
   std::string summary; ///< 成功概述或输入无效/检测失败原因。
 
   /** @return 帧模式至少 1 个有效站位、空间切片至少 3 个有效站位时为 true。
-   * 单道计中心点数，双道计两侧较小点数；不代表所有输入帧均有输出。 */
+   * 单道计中心点数，独立轨迹计有效侧最大点数；不代表所有输入帧均有输出。 */
   bool ok() const {
     const std::size_t minimum = frameBased ? 1 : 3;
     return (centerSeam ? centerSeam->size() : 0) +
-           (leftSeam && rightSeam ? std::min(leftSeam->size(),rightSeam->size()) : 0) >= minimum;
+           (leftSeam && rightSeam ? std::max(leftSeam->size(),rightSeam->size()) : 0) >= minimum;
   }
 };
 

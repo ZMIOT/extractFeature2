@@ -271,36 +271,6 @@ void smoothSide(CloudT &points, std::vector<float> &confidence,
   }
 }
 
-void enforcePairSeparation(SeamResult &result, const CloudT &leftBefore,
-                           const CloudT &rightBefore,
-                           const DetectorConfig &config) {
-  const int sideAxis = localTransverseAxes(config.longitudinalAxis)[0];
-  const std::size_t count = std::min(result.leftSeam->size(),
-                                     result.rightSeam->size());
-  for (std::size_t i = 0; i < count; ++i) {
-    const float oldWidth = rightBefore[i].data[sideAxis] -
-                           leftBefore[i].data[sideAxis];
-    const float newWidth = (*result.rightSeam)[i].data[sideAxis] -
-                           (*result.leftSeam)[i].data[sideAxis];
-    if (newWidth >= config.minSeamSeparation)
-      continue;
-    float scale = 0.0f;
-    if (oldWidth > config.minSeamSeparation && oldWidth > newWidth)
-      scale = clamp01((oldWidth - config.minSeamSeparation) /
-                      (oldWidth - newWidth));
-    (*result.leftSeam)[i].data[sideAxis] =
-        leftBefore[i].data[sideAxis] +
-        scale * ((*result.leftSeam)[i].data[sideAxis] -
-                 leftBefore[i].data[sideAxis]);
-    (*result.rightSeam)[i].data[sideAxis] =
-        rightBefore[i].data[sideAxis] +
-        scale * ((*result.rightSeam)[i].data[sideAxis] -
-                 rightBefore[i].data[sideAxis]);
-    result.leftPointQuality[i].flags |= QualityPairConstraintLimited;
-    result.rightPointQuality[i].flags |= QualityPairConstraintLimited;
-  }
-}
-
 SeamSmoothingSummary summarize(const CloudT &before, const CloudT &after,
                                std::vector<SeamPointQuality> &quality) {
   SeamSmoothingSummary summary;
@@ -328,13 +298,12 @@ SeamSmoothingSummary summarize(const CloudT &before, const CloudT &after,
 } // namespace
 
 namespace {
-// Solve both curves together: curvature regularization, robust observations,
-// independently observed wall strips, and pair width in the same optimization.
+// Block-diagonal solves: each side uses only its own observations and wall strip.
 bool fitTrackedCurves(SeamResult &result, const DetectorConfig &config) {
-  const int n=int(result.leftSeam->size());
-  if (!n || result.rightSeam->size()!=std::size_t(n)) return false;
+  const int leftCount=int(result.leftSeam->size()), rightCount=int(result.rightSeam->size());
+  if(!leftCount && !rightCount)return false;
   const auto axes=localTransverseAxes(config.longitudinalAxis);
-  const int station=int(config.longitudinalAxis), size=4*n;
+  const int station=int(config.longitudinalAxis), size=2*(leftCount+rightCount);
   const std::array<CloudT*,2> clouds{{result.leftSeam.get(),result.rightSeam.get()}};
   const std::array<std::vector<SeamPointQuality>*,2> qualities{{&result.leftPointQuality,&result.rightPointQuality}};
   const std::array<const std::vector<float>*,2> confidences{{&result.leftPointConfidence,&result.rightPointConfidence}};
@@ -343,12 +312,15 @@ bool fitTrackedCurves(SeamResult &result, const DetectorConfig &config) {
   for (const auto *q:qualities) for (const auto &p:*q) tracked|=p.trackedWall;
   if (!tracked) return false;
   Eigen::VectorXd observed(size),base(size),weights(size);
-  const Eigen::Vector2d origin((*clouds[0])[0].data[axes[0]],(*clouds[0])[0].data[axes[1]]);
+  const auto &first=leftCount?(*clouds[0])[0]:(*clouds[1])[0];
+  const Eigen::Vector2d origin(first.data[axes[0]],first.data[axes[1]]);
   std::vector<Eigen::Triplet<double>> penalty, constraints;
   std::vector<double> lower,upper;
   const double lambda=std::pow(double(config.finalSmoothingLength)/(2*3.141592653589793),4);
   for (int side=0;side<2;++side) {
     const auto &cloud=*clouds[side];
+    const int n=int(cloud.size()),offset=side?2*leftCount:0;
+    if(!n)continue;
     auto starts=normalizedStarts(*segments[side],n);
     std::vector<float> gaps;
     for (int i=1;i<n;++i) if (cloud[i].data[station]>cloud[i-1].data[station])
@@ -356,7 +328,7 @@ bool fitTrackedCurves(SeamResult &result, const DetectorConfig &config) {
     std::sort(gaps.begin(),gaps.end());
     const double maxGap=gaps.empty()?0:gaps[gaps.size()/2]*std::max(2.,double(config.maxInterpolatedGapStations)+1.5);
     for (int i=0;i<n;++i) {
-      const int index=4*i+2*side;
+      const int index=offset+2*i;
       const double score=i<int(confidences[side]->size()) ? (*confidences[side])[i] : 1;
       for (int dim=0;dim<2;++dim) { observed[index+dim]=double(cloud[i].data[axes[dim]])-origin[dim]; base[index+dim]=std::max(.1,std::min(1.,score)); }
       if (i<int(qualities[side]->size())) {
@@ -375,13 +347,8 @@ bool fitTrackedCurves(SeamResult &result, const DetectorConfig &config) {
       if (h0<=1.e-5 || h1<=1.e-5 || h0>maxGap || h1>maxGap) continue;
       const double d[3]={2/(h0*(h0+h1)),-2/(h0*h1),2/(h1*(h0+h1))};
       for (int dim=0;dim<2;++dim) for (int r=0;r<3;++r) for (int c=0;c<3;++c)
-        penalty.emplace_back(4*(i+r-1)+2*side+dim,4*(i+c-1)+2*side+dim,lambda*d[r]*d[c]);
+        penalty.emplace_back(offset+2*(i+r-1)+dim,offset+2*(i+c-1)+dim,lambda*d[r]*d[c]);
     }
-  }
-  for (int i=0;i<n;++i) {
-    const int row=int(lower.size());
-    constraints.emplace_back(row,4*i,-1); constraints.emplace_back(row,4*i+2,1);
-    lower.push_back(config.minSeamSeparation); upper.push_back(std::numeric_limits<double>::infinity());
   }
   Eigen::SparseMatrix<double> a(int(lower.size()),size),regularizer(size,size);
   a.setFromTriplets(constraints.begin(),constraints.end()); regularizer.setFromTriplets(penalty.begin(),penalty.end());
@@ -410,9 +377,9 @@ bool fitTrackedCurves(SeamResult &result, const DetectorConfig &config) {
   }
   Eigen::VectorXd check=a*x,bounded=check; clip(bounded);
   if ((check-bounded).lpNorm<Eigen::Infinity>()>1.e-3)
-    throw std::runtime_error("Observed walls and requested seam width have no converged feasible curve");
-  for (int side=0;side<2;++side) for (int i=0;i<n;++i) for (int dim=0;dim<2;++dim)
-    (*clouds[side])[i].data[axes[dim]]=float(x[4*i+2*side+dim]+origin[dim]);
+    throw std::runtime_error("Observed wall constraints have no converged feasible curve");
+  for (int side=0;side<2;++side) for (int i=0;i<int(clouds[side]->size());++i) for (int dim=0;dim<2;++dim)
+    (*clouds[side])[i].data[axes[dim]]=float(x[(side?2*leftCount:0)+2*i+dim]+origin[dim]);
   return true;
 }
 
@@ -536,19 +503,6 @@ void applyFinalCurveSmoothing(SeamResult &result, const DetectorConfig &config) 
   if (!tracked) {
     fitFinalCurve(*result.leftSeam, result.leftPointConfidence, result.leftSegmentStarts, config);
     fitFinalCurve(*result.rightSeam, result.rightPointConfidence, result.rightSegmentStarts, config);
-  }
-  const int across = localTransverseAxes(config.longitudinalAxis)[0];
-  const int station = int(config.longitudinalAxis);
-  // Enforce width around the smooth center, never restore individual noisy points.
-  for (std::size_t i=0; !tracked && i<std::min(result.leftSeam->size(),result.rightSeam->size()); ++i) {
-    auto &left = (*result.leftSeam)[i]; auto &right = (*result.rightSeam)[i];
-    if (std::abs(left.data[station]-right.data[station]) > 1.e-4f) continue;
-    if (right.data[across]-left.data[across] >= config.minSeamSeparation) continue;
-    const float center = .5f*(left.data[across]+right.data[across]);
-    left.data[across] = center-.5f*config.minSeamSeparation;
-    right.data[across] = center+.5f*config.minSeamSeparation;
-    if (i<result.leftPointQuality.size()) result.leftPointQuality[i].flags |= QualityPairConstraintLimited;
-    if (i<result.rightPointQuality.size()) result.rightPointQuality[i].flags |= QualityPairConstraintLimited;
   }
   result.leftFinalCurve = finalCurveSummary(leftBefore,*result.leftSeam,result.leftPointQuality,config);
   result.rightFinalCurve = finalCurveSummary(rightBefore,*result.rightSeam,result.rightPointQuality,config);
@@ -723,67 +677,44 @@ SeamWidthDecision classifySeamWidth(const SeamResult &result, const DetectorConf
 }
 
 void trimSeamEndpoints(SeamResult &result, const DetectorConfig &config, const std::vector<float> *scanStations,
-                       const SeamWidthDecision *decision) {
+                       const SeamWidthDecision *decision, const std::vector<float> *rightStations) {
   result.endpointTrimmedStart=result.endpointTrimmedEnd=0;
-  if (!config.trimUnstableEndpoints || !result.leftSeam || !result.rightSeam ||
-      result.leftSeam->size()!=result.rightSeam->size() || result.leftSeam->size()<9 ||
-      !std::isfinite(config.endpointTrimWindow) || config.endpointTrimWindow<=0 ||
-      !std::isfinite(config.endpointTrimDeviation) || config.endpointTrimDeviation<=0 ||
-      !std::isfinite(config.endpointTrimAngleDegrees) || config.endpointTrimAngleDegrees<=0 ||
-      config.endpointTrimAngleDegrees>=90) return;
-  const auto count=result.leftSeam->size();
-  const auto &left=*result.leftSeam; const auto &right=*result.rightSeam;
-  const int axis=int(config.longitudinalAxis);
-  std::vector<float> stations;
-  if (scanStations) {
-    if (scanStations->size()!=count) return;
-    stations=*scanStations;
-  } else for (const auto &p:left) stations.push_back(p.data[axis]);
-  for (float value:stations) if (!std::isfinite(value)) return;
-  auto starts=normalizedStarts(result.leftSegmentStarts,count);
-  auto rightStarts=normalizedStarts(result.rightSegmentStarts,count);
-  starts.insert(starts.end(),rightStarts.begin(),rightStarts.end());
-  std::vector<float> gaps;
-  for (std::size_t i=1;i<count;++i) {
-    const float gap=stations[i]-stations[i-1];
-    if (gap>1.e-5f && std::isfinite(gap)) gaps.push_back(gap);
+  result.sideEndpointTrimmedStart={{0,0}};result.sideEndpointTrimmedEnd={{0,0}};
+  for(int side=0;side<2;++side) {
+    auto &cloud=side?result.rightSeam:result.leftSeam;
+    auto &frames=side?result.rightFrameIndices:result.leftFrameIndices;
+    auto &confidence=side?result.rightPointConfidence:result.leftPointConfidence;
+    auto &quality=side?result.rightPointQuality:result.leftPointQuality;
+    auto &segmentStarts=side?result.rightSegmentStarts:result.leftSegmentStarts;
+    const auto *parameter=side?rightStations:scanStations;
+    if(side && !parameter && scanStations && scanStations->size()==cloud->size())parameter=scanStations;
+    if(!config.trimUnstableEndpoints || cloud->size()<9 || config.endpointTrimWindow<=0 ||
+        !std::isfinite(config.endpointTrimWindow) || !std::isfinite(config.endpointTrimDeviation) ||
+        !std::isfinite(config.endpointTrimAngleDegrees) || config.endpointTrimDeviation<=0 ||
+        config.endpointTrimAngleDegrees<=0 || config.endpointTrimAngleDegrees>=90)continue;
+    const auto count=cloud->size();std::vector<float> stations;
+    if(parameter) {if(parameter->size()!=count)continue;stations=*parameter;}
+    else for(const auto &p:*cloud)stations.push_back(coordinate(p,config.longitudinalAxis));
+    if(std::any_of(stations.begin(),stations.end(),[](float x){return !std::isfinite(x);}))continue;
+    auto starts=normalizedStarts(segmentStarts,count);
+    std::vector<float> gaps;
+    for(std::size_t i=1;i<count;++i)if(stations[i]>stations[i-1]+1.e-5f)gaps.push_back(stations[i]-stations[i-1]);
+    if(gaps.empty())continue;
+    std::sort(gaps.begin(),gaps.end());
+    const double maxGap=gaps[gaps.size()/2]*std::max(2.,double(config.maxInterpolatedGapStations)+1.5);
+    for(std::size_t i=1;i<count;++i)if(stations[i]-stations[i-1]<=1.e-5f || stations[i]-stations[i-1]>maxGap)starts.push_back(i);
+    starts.push_back(count);std::sort(starts.begin(),starts.end());starts.erase(std::unique(starts.begin(),starts.end()),starts.end());
+    const auto begin=endpointCut(*cloud,*cloud,0,starts[1],true,config,stations);
+    const auto end=endpointCut(*cloud,*cloud,starts[starts.size()-2],count,false,config,stations);
+    if(!begin && end==count)continue;
+    CloudT::Ptr kept(new CloudT);for(auto i=begin;i<end;++i)kept->push_back((*cloud)[i]);cloud=kept;
+    retainEndpointRange(frames,begin,end);retainEndpointRange(confidence,begin,end);retainEndpointRange(quality,begin,end);
+    retainEndpointStarts(segmentStarts,begin,end);
+    auto &score=side?result.rightConfidence:result.leftConfidence;
+    if(!confidence.empty())score=std::accumulate(confidence.begin(),confidence.end(),0.f)/confidence.size();
+    result.sideEndpointTrimmedStart[side]=begin;result.sideEndpointTrimmedEnd[side]=count-end;
+    if(!side) {result.endpointTrimmedStart=begin;result.endpointTrimmedEnd=count-end;}
   }
-  if (gaps.empty()) return;
-  std::sort(gaps.begin(),gaps.end());
-  const double maxGap=gaps[gaps.size()/2]*std::max(2.0,double(config.maxInterpolatedGapStations)+1.5);
-  for (std::size_t i=1;i<count;++i) {
-    const double gap=stations[i]-stations[i-1];
-    if (gap<=1.e-5 || gap>maxGap) starts.push_back(i);
-  }
-  starts.push_back(count);
-  std::sort(starts.begin(),starts.end()); starts.erase(std::unique(starts.begin(),starts.end()),starts.end());
-  const auto widthDecision=decision ? *decision : classifySeamWidth(result,config);
-  CloudT center;
-  if (widthDecision.mode==1) {
-    center.reserve(count);
-    for (std::size_t i=0;i<count;++i)
-      center.push_back(toPoint(.5f*(toVector(left[i])+toVector(right[i]))));
-  }
-  // A single seam follows the center. Width changes alone must not stop it
-  // when both independently supported boundaries still define a stable center.
-  const auto &trimLeft=widthDecision.mode==1 ? center : left;
-  const auto &trimRight=widthDecision.mode==1 ? center : right;
-  const auto begin=endpointCut(trimLeft,trimRight,0,starts[1],true,config,stations);
-  const auto end=endpointCut(trimLeft,trimRight,starts[starts.size()-2],count,false,config,stations);
-  if (begin==0 && end==count) return;
-  // Only remove observations; do not extrapolate replacement endpoints.
-  CloudT::Ptr keptLeft(new CloudT), keptRight(new CloudT);
-  for (auto i=begin;i<end;++i) { keptLeft->push_back(left[i]); keptRight->push_back(right[i]); }
-  result.leftSeam=keptLeft; result.rightSeam=keptRight;
-  retainEndpointRange(result.leftFrameIndices,begin,end); retainEndpointRange(result.rightFrameIndices,begin,end);
-  retainEndpointRange(result.leftPointConfidence,begin,end); retainEndpointRange(result.rightPointConfidence,begin,end);
-  retainEndpointRange(result.leftPointQuality,begin,end); retainEndpointRange(result.rightPointQuality,begin,end);
-  retainEndpointStarts(result.leftSegmentStarts,begin,end); retainEndpointStarts(result.rightSegmentStarts,begin,end);
-  if (!result.leftPointConfidence.empty()) result.leftConfidence=
-      std::accumulate(result.leftPointConfidence.begin(),result.leftPointConfidence.end(),0.f)/result.leftPointConfidence.size();
-  if (!result.rightPointConfidence.empty()) result.rightConfidence=
-      std::accumulate(result.rightPointConfidence.begin(),result.rightPointConfidence.end(),0.f)/result.rightPointConfidence.size();
-  result.endpointTrimmedStart=begin; result.endpointTrimmedEnd=count-end;
 }
 
 void applySeamWidthRule(SeamResult &result, const DetectorConfig &config, const SeamWidthDecision *decision) {
@@ -850,11 +781,6 @@ void applySeamPostprocess(SeamResult &result, const DetectorConfig &config) {
              result.leftPointQuality, result.leftSegmentStarts, config);
   smoothSide(*result.rightSeam, result.rightPointConfidence,
              result.rightPointQuality, result.rightSegmentStarts, config);
-  if (leftBefore.size() == result.leftSeam->size() &&
-      rightBefore.size() == result.rightSeam->size() &&
-      result.leftPointQuality.size() == result.leftSeam->size() &&
-      result.rightPointQuality.size() == result.rightSeam->size())
-    enforcePairSeparation(result, leftBefore, rightBefore, config);
   result.leftSmoothing =
       summarize(leftBefore, *result.leftSeam, result.leftPointQuality);
   result.rightSmoothing =

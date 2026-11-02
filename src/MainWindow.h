@@ -60,8 +60,11 @@ private:
             *showCloud_ = nullptr;
   QCheckBox *showLeftSurface_ = nullptr, *showRightSurface_ = nullptr,
             *showWeldSurface_ = nullptr, *showTracks_ = nullptr,
-            *showBody_ = nullptr;
+            *showBody_ = nullptr, *showFittedSurfaces_ = nullptr,
+            *showSurfacePoints_ = nullptr;
+  std::array<pcl::PolygonMesh,3> surfaceMeshes_;
   QCheckBox *trimEndpoints_ = nullptr;
+  QCheckBox *limitSurfaceEnds_ = nullptr;
   QCheckBox *generateSurfaceModels_ = nullptr;
   QDoubleSpinBox *minimumFeatureDepth_ = nullptr;
   QDoubleSpinBox *endpointAngle_ = nullptr, *endpointWindow_ = nullptr, *endpointDeviation_ = nullptr;

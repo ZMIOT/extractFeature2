@@ -132,6 +132,8 @@ struct DebugTrace {
   std::vector<DebugSlice> slices;
   std::array<std::vector<PointT>, 2> selectedPath, interpolatedPath;
   std::array<std::vector<PointT>, 2> beforeWallPath;
+  // Measured feet considered for endpoint recovery, in station/u/v coordinates.
+  std::array<std::vector<PointT>, 2> measuredWallFeet;
   std::vector<DebugWallPoint> wallPoints;
   float optimalCost = 0;
   bool pathComplete = false;

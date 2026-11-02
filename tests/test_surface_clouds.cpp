@@ -1,6 +1,7 @@
 #include "SurfaceClouds.h"
 #include "SeamDetector.h"
 #include "AlgorithmParameters.h"
+#include "SeamSmoother.h"
 #include "PointCloudIO.h"
 #include <cmath>
 #include <iostream>
@@ -32,7 +33,7 @@ void checkMeasured(const weld::CloudT &input, const weld::SeamResult &result) {
   }
 }
 
-void geometryTest(weld::Axis axis, int opening, int wallShape, bool framed) {
+void geometryTest(weld::Axis axis, int opening, int wallShape, bool framed, bool testEnds=false) {
   weld::DetectorConfig config;
   config.longitudinalAxis=axis;
   config.interiorOpeningDirection=opening;
@@ -84,6 +85,34 @@ void geometryTest(weld::Axis axis, int opening, int wallShape, bool framed) {
   std::cout<<"geometry axis="<<a<<" opening="<<opening<<" shape="<<wallShape<<" framed="<<framed
            <<": "<<result.leftSurface->size()<<"/"<<result.rightSurface->size()<<"/"<<result.weldSurface->size()<<'\n';
   checkMeasured(*input,result);
+  if(testEnds) {
+    std::array<weld::SurfaceEnd,2> ends;
+    ends[0].valid=ends[1].valid=true;
+    ends[0].station=8;ends[0].point=point(8,-8,0);
+    ends[1].station=18;ends[1].point=point(18,8,0);
+    weld::SeamResult limited;
+    weld::extractSurfaceClouds(input,sections,config,limited,framed?&frames:nullptr,true,&ends);
+    checkMeasured(*input,limited);
+    for(int side=0;side<3;++side) {
+      const auto before=side==0?result.leftSurface:side==1?result.rightSurface:result.weldSurface;
+      const auto after=side==0?limited.leftSurface:side==1?limited.rightSurface:limited.weldSurface;
+      std::set<Key> expected;
+      for(const auto &p:*before) {
+        const float station=framed?-(p.data[a]-.15f*p.data[u]):p.data[a];
+        const float fraction=std::max(0.f,std::min(1.f,(p.data[u]+8)/16));
+        const float stop=side==0?8:side==1?18:8+fraction*10;
+        if(station<=stop+1.e-4f)expected.insert(key(p));
+      }
+      require(after->size()==expected.size(),"Independent surface endpoints lost valid coverage");
+      for(const auto &p:*after)require(expected.count(key(p))!=0,"Surface exceeded its independent endpoint");
+      require(after->size()<before->size(),"Endpoint limit did not remove the tail");
+    }
+    require(limited.weldSurfaceModel.valid(),"Limited floor model was not fitted");
+    config.limitSurfaceEndsToTracks=false;
+    weld::SeamResult restored;
+    weld::extractSurfaceClouds(input,sections,config,restored,framed?&frames:nullptr,false,&ends);
+    require(restored.weldSurface->size()==result.weldSurface->size(),"Surface end opt-out did not restore coverage");
+  }
   require(result.leftSurface->size()>1200 && result.rightSurface->size()>1200,
           "Too much side-wall coverage lost");
   require(result.weldSurface->size()>1300, "Too much bowed weld-face coverage lost");
@@ -240,9 +269,234 @@ void shortTransitionTest(weld::Axis axis,int opening) {
   require(result.leftSurface->empty() && result.rightSurface->empty() && result.weldSurface->empty(),
           "Flat floor was invented into three surfaces");
 }
+
+void singleWallFloorTest(weld::Axis axis,int opening,int side) {
+  weld::DetectorConfig config;
+  config.longitudinalAxis=axis;config.interiorOpeningDirection=opening;
+  const int a=int(axis),u=a==0?1:0,v=a==2?1:2,inward=side==0?1:-1;
+  auto point=[&](float station,float distance,float height) {
+    weld::PointT p;p.data[a]=station+.1f*distance;
+    p.data[u]=inward*distance;p.data[v]=opening*height;return p;
+  };
+  weld::CloudT::Ptr input(new weld::CloudT);
+  std::vector<weld::ScanFrameRange> frames;
+  std::vector<weld::SurfaceSection> sections;
+  for(int f=0;f<12;++f) {
+    const auto begin=input->size();
+    for(int j=0;j<=300;++j) {
+      const float distance=.1f*j;
+      // A curved measured floor, a detached parallel sheet, and a disconnected
+      // continuation beyond a real gap. None requires an opposite trajectory.
+      const float height=.001f*distance*distance+(f>=7?2*std::max(0.f,distance-20):0);
+      input->push_back(point(float(f),distance,height));
+      input->push_back(point(float(f),distance,8+.001f*distance*distance));
+      input->push_back(point(float(f),distance+40,0));
+    }
+    for(int j=1;j<=150;++j) {
+      const float height=.1f*j;
+      input->push_back(point(float(f),-.5f*height,height));
+      input->push_back(point(float(f),-8-.1f*j,15)); // outer shoulder
+    }
+    frames.push_back({begin,input->size()-begin,100+f});
+    if(f==6)continue;
+    weld::SurfaceSection section;section.station=float(f);section.frameIndex=100+f;
+    section.leftValid=side==0;section.rightValid=side==1;
+    section.left=point(float(f),side==0?0:8,0);
+    section.right=point(float(f),side==0?8:0,0);
+    (side==0?section.leftNormal:section.rightNormal)=Eigen::Vector2f(1,inward*opening*.5f).normalized();
+    sections.push_back(section);
+  }
+  weld::SeamResult result;
+  weld::extractSurfaceClouds(input,sections,config,result,&frames);
+  require((side==0?result.rightSurface:result.leftSurface)->empty(),"Single wall invented the opposite surface");
+  require(!(side==0?result.leftSurface:result.rightSurface)->empty(),"Single wall surface disappeared");
+  require(result.weldSurface->size()>2600,"Single wall lost its connected measured floor");
+  require(result.weldSurfaceModel.valid(),"Single wall floor model was not fitted");
+  std::set<Key> measured,used;
+  for(const auto &p:*input)measured.insert(key(p));
+  for(const auto &cloud:{result.leftSurface,result.rightSurface,result.weldSurface})
+    for(const auto &p:*cloud) {
+      require(measured.count(key(p)) && used.insert(key(p)).second,"Single wall surfaces changed or reused a measurement");
+      require(std::abs(p.data[a]-.1f*inward*p.data[u]-6)>1.e-4f,"Single wall filled an absent section");
+    }
+  for(const auto &p:*result.weldSurface) {
+    const float distance=inward*p.data[u],height=opening*p.data[v];
+    require(distance>0 && distance<=30.001f && height<1,"Single wall floor crossed a gap, wall or detached sheet");
+  }
+  for(auto &section:sections)section.leftValid=section.rightValid=false;
+  weld::extractSurfaceClouds(input,sections,config,result,&frames,false);
+  require(result.weldSurface->empty(),"Unsupported section generated a floor");
+}
+
+void measuredFootContinuationTest() {
+  weld::DetectorConfig config;
+  weld::CloudT candidate,physical;
+  std::vector<float> stations;
+  std::vector<weld::SurfaceEnd> feet;
+  for(int i=0;i<=400;++i) {
+    const float s=.5f*i,hook=.03f*std::pow(std::max(0.f,s-170),2);
+    weld::PointT p{s,8,hook};physical.push_back(p);
+    weld::SurfaceEnd foot;foot.valid=true;foot.station=s;foot.point=p;feet.push_back(foot);
+    p.y-=std::min(18.f,std::max(0.f,(s-120)*1.2f));
+    candidate.push_back(p);stations.push_back(s);
+  }
+  // Missing single frames and a detached contact must not terminate the run,
+  // nor may a replacement point be generated at those indices.
+  feet[250].valid=feet[251].valid=false;feet[270].point.y+=30;
+  const auto recovered=weld::selectMeasuredFootContinuation(candidate,stations,feet,240,config);
+  require(!recovered.recovered.empty() && recovered.kept.back()==400,"Supported wall-foot tail was not recovered");
+  for(auto index:{250u,251u,270u})
+    require(std::find(recovered.kept.begin(),recovered.kept.end(),index)==recovered.kept.end(),"Unsupported foot was retained or invented");
+  require(weld::selectMeasuredFootContinuation(physical,stations,feet,340,config).kept.empty(),
+          "A genuine physical hook was misidentified as candidate drift");
+  auto remote=feet;for(auto &foot:remote)foot.point.y+=40;
+  require(weld::selectMeasuredFootContinuation(candidate,stations,remote,240,config).kept.empty(),
+          "Recovery jumped to a disconnected parallel wall");
+  auto gap=feet;for(int i=300;i<=320;++i)gap[i].valid=false;
+  const auto broken=weld::selectMeasuredFootContinuation(candidate,stations,gap,240,config);
+  require(!broken.kept.empty() && broken.kept.back()==299,"Recovery crossed a sustained measurement gap");
+  // Once repaired, the real right hook still trims independently. The left
+  // track is straight and must remain complete.
+  weld::SeamResult result;std::vector<float> rightStations;
+  for(std::size_t i=0;i<stations.size();++i)result.leftSeam->push_back({stations[i],-8,0});
+  for(auto i:recovered.kept) {
+    result.rightSeam->push_back(physical[i]);rightStations.push_back(stations[i]);
+  }
+  weld::trimSeamEndpoints(result,config,&stations,nullptr,&rightStations);
+  require(result.leftSeam->size()==401 && result.rightSeam->back().x>165 && result.rightSeam->back().x<195,
+          "Recovered track did not stop independently at the real physical hook");
+}
+
+void endpointSurfaceTest() {
+  weld::DetectorConfig config;
+  config.limitSurfaceEndsToTracks=false;
+  config.extractMainBody=false;config.inputVoxelSize=0;config.voxelSize=0;config.outlierMeanK=0;
+  config.useSurfaceRefinement=false;config.trimUnstableEndpoints=false;
+  weld::CloudT::Ptr input(new weld::CloudT);
+  std::vector<weld::ScanFrameRange> frames;
+  auto bend=[](float x){const float t=std::max(0.f,x-170);return .015f*t*t;};
+  for(int f=0;f<=240;++f) {
+    if(f==210)continue; // Missing measurements must remain absent in surfaces.
+    const auto begin=input->size();
+    for(int j=-250;j<=250;++j) {
+      const float y=.1f*j,z=std::min(16.f,std::max(0.f,(std::abs(y)-8)*2));
+      input->push_back({float(f),y+bend(float(f)),z});
+    }
+    frames.push_back({begin,input->size()-begin,1000+f});
+  }
+  const auto untrimmed=weld::SeamDetector().detect(input,config,nullptr,nullptr,nullptr,&frames);
+  config.trimUnstableEndpoints=true;
+  const auto trimmed=weld::SeamDetector().detect(input,config,nullptr,nullptr,nullptr,&frames);
+  require(untrimmed.ok() && trimmed.ok(),"Bent endpoint fixture did not detect");
+  require(trimmed.sideEndpointTrimmedEnd[0]>0 && trimmed.sideEndpointTrimmedEnd[1]>0,
+          "Bent endpoint fixture did not exercise trajectory cuts");
+  checkMeasured(*input,trimmed);
+  for(int side=0;side<2;++side) {
+    const auto &cut=side?*trimmed.rightSeam:*trimmed.leftSeam;
+    const auto &all=side?*untrimmed.rightSeam:*untrimmed.leftSeam;
+    const auto begin=trimmed.sideEndpointTrimmedStart[side];
+    require(cut.size()+begin+trimmed.sideEndpointTrimmedEnd[side]==all.size(),"Surface recovery changed trajectory cuts");
+    for(std::size_t i=0;i<cut.size();++i)
+      require(key(cut[i])==key(all[begin+i]),"Surface recovery moved a trimmed trajectory point");
+  }
+  for(int face=0;face<3;++face) {
+    const auto &before=face==0?*untrimmed.leftSurface:face==1?*untrimmed.rightSurface:*untrimmed.weldSurface;
+    const auto &after=face==0?*trimmed.leftSurface:face==1?*trimmed.rightSurface:*trimmed.weldSurface;
+    require(after.size()>=.95*before.size(),"Trajectory endpoint cuts discarded measured surface sections");
+    std::set<Key> originalSurface;
+    for(const auto &p:before)originalSurface.insert(key(p));
+    const float retainedEnd=std::min(trimmed.leftSeam->back().x,trimmed.rightSeam->back().x);
+    float last=-1;
+    for(std::size_t i=0;i<after.size();++i) {
+      if(after[i].x<=retainedEnd)require(originalSurface.count(key(after[i]))!=0,"Endpoint recovery altered retained surface labels");
+      require(after[i].x!=210,"Surface recovery filled an unmeasured frame");
+      last=std::max(last,after[i].x);
+      if(face==2)require(std::abs(after[i].z)<1.e-4f,"Recovered floor contains upper walls");
+    }
+    require(last>=230,"Supported bent surface endpoint was lost");
+  }
+  require(trimmed.weldSurfaceModel.valid(),"Recovered endpoint floor model was not fitted");
+  config.limitSurfaceEndsToTracks=true;
+  const auto limited=weld::SeamDetector().detect(input,config,nullptr,nullptr,nullptr,&frames);
+  require(limited.ok(),"Synchronized endpoint fixture did not detect");
+  checkMeasured(*input,limited);
+  for(int side=0;side<2;++side) {
+    const auto &before=side?*trimmed.rightSeam:*trimmed.leftSeam;
+    const auto &after=side?*limited.rightSeam:*limited.leftSeam;
+    require(before.size()==after.size(),"Surface limits changed trajectory length");
+    for(std::size_t i=0;i<before.size();++i)require(key(before[i])==key(after[i]),"Surface limits moved trajectory");
+    for(const auto &p:*(side?limited.rightSurface:limited.leftSurface))
+      require(p.x<=after.back().x+1.e-4f,"Side surface exceeded its trajectory end");
+  }
+  require(limited.weldSurface->size()<trimmed.weldSurface->size(),"Floor did not stop with trajectories");
+  std::cout<<"Endpoint trim retains measured surfaces and models; trajectory cuts and frame gaps preserved.\n";
+}
+
+void rejectedBoundaryTest() {
+  for(int opening:{-1,1})for(bool single:{false,true}) {
+    weld::DetectorConfig config;config.interiorOpeningDirection=opening;
+    weld::CloudT::Ptr input(new weld::CloudT);
+    std::vector<weld::SurfaceSection> sections;
+    for(int f=0;f<8;++f) {
+      const float x=2.f*f;
+      for(int j=-300;j<=300;++j) {
+        input->push_back({x,.1f*j,0});
+        input->push_back({x,.1f*j,-12.f*opening}); // detached floor
+      }
+      for(int side:{-1,1})if(!single || side==1)for(int j=1;j<=150;++j) {
+        const float height=.1f*j;
+        input->push_back({x,side*(30+.5f*height),opening*height});
+        input->push_back({x,side*(50+.5f*height),opening*height}); // detached wall
+      }
+      weld::SurfaceSection section;section.station=x;
+      // Rejected track points lie on a weak interior feature, far from the
+      // true walls. They cannot be trusted as toe patches or as floor limits.
+      section.left={x,-4,-4.f*opening};section.right={x,4,-4.f*opening};
+      section.leftBoundaryUncertain=section.rightBoundaryUncertain=true;
+      sections.push_back(section);
+    }
+    weld::SeamResult result;
+    std::vector<std::array<weld::SurfaceEnd,2>> feet;
+    weld::extractSurfaceClouds(input,sections,config,result,nullptr,false,nullptr,&feet);
+    require(feet.size()==sections.size(),"Measured feet lost section alignment");
+    std::set<Key> original;
+    for(const auto &p:*input)original.insert(key(p));
+    for(const auto &pair:feet)for(int side=0;side<2;++side) {
+      require(pair[side].valid==(!single || side==1),"Measured foot invented a missing wall or lost a supported one");
+      if(pair[side].valid) {
+        require(original.count(key(pair[side].point))!=0,"Recovered wall foot was not measured");
+        require(std::abs(std::abs(pair[side].point.y)-30)<3 && pair[side].point.z==0,
+                "Recovered wall foot follows an interior ripple or detached sheet");
+      }
+    }
+    std::cout<<"Rejected boundary opening="<<opening<<" single="<<single<<" surfaces="<<result.leftSurface->size()<<'/'<<result.rightSurface->size()<<'/'<<result.weldSurface->size()<<'\n';
+    require(result.weldSurface->size()>4400,"Rejected interior boundary hid the measured broad floor");
+    require(result.rightSurface->size()>800,"Rejected boundary hid the measured right wall");
+    if(single)require(result.leftSurface->empty(),"Rejected boundary created a missing wall");
+    else checkMeasured(*input,result);
+    for(const auto &p:*result.weldSurface)
+      require(std::abs(p.y)<=30.001f && p.z==0,"Boundary recovery included a detached sheet or wall");
+    for(const auto &cloud:{result.leftSurface,result.rightSurface})for(const auto &p:*cloud)
+      require(std::abs(p.y)<40,"Boundary recovery selected a detached parallel wall");
+  }
+}
 }
 int main(int argc,char **argv) {
   try {
+    if(argc==2 && std::string(argv[1])=="--endpoint-surfaces") {
+      measuredFootContinuationTest();
+      for(auto axis:{weld::Axis::X,weld::Axis::Y,weld::Axis::Z})
+        for(bool framed:{false,true})geometryTest(axis,1,0,framed,true);
+      rejectedBoundaryTest();
+      endpointSurfaceTest();
+      return 0;
+    }
+    if(argc==2 && std::string(argv[1])=="--single-wall-floor") {
+      for(auto axis:{weld::Axis::X,weld::Axis::Y,weld::Axis::Z})
+        for(int opening:{-1,1})for(int side:{0,1})singleWallFloorTest(axis,opening,side);
+      std::cout<<"Single-wall measured floor, model, axes, gaps and detached sheets passed.\n";
+      return 0;
+    }
     if(argc==3) {
       std::string error;
       const auto input=weld::PointCloudIO::load(argv[1],&error);
@@ -282,7 +536,10 @@ int main(int argc,char **argv) {
     roughWeldTest();
     shallowTipTest();
     for(auto axis:{weld::Axis::X,weld::Axis::Y,weld::Axis::Z})
-      for(int opening:{-1,1})shortTransitionTest(axis,opening);
+      for(int opening:{-1,1}) {
+        shortTransitionTest(axis,opening);
+        for(int side:{0,1})singleWallFloorTest(axis,opening,side);
+      }
     std::cout<<"Three measured surfaces: geometry, coverage, axes, reversed tilted frames, gaps and defaults passed.\n";
     return 0;
   } catch(const std::exception &error) { std::cerr<<error.what()<<'\n';return 1; }

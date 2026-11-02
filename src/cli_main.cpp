@@ -53,6 +53,7 @@ int main(int argc, char **argv) {
         << "  --uniform-width arc|chord  Trim each width tail by 10%, then place a uniform pair along the bottom\n"
         << "  --no-uniform-width-filter  --uniform-width-filter-length 12\n"
         << "  --no-endpoint-trim  --endpoint-window 12  --endpoint-angle 20  --endpoint-deviation 1.5\n"
+        << "  --independent-surface-ends (retain measured faces beyond trajectory ends)\n"
         << "  --final-smoothing-length 12  --final-robust-scale 0.6\n"
         << "  --profile-curvature-radius 8  --no-profile-curvature\n"
         << "  --localization curve-line|curvature (default curvature)\n"
@@ -196,6 +197,7 @@ int main(int argc, char **argv) {
     }
     if (key == "--exhaustive-candidates") { config.useWallCandidatePruning=false; continue; }
     if (key == "--no-endpoint-trim") { config.trimUnstableEndpoints=false; continue; }
+    if (key == "--independent-surface-ends") { config.limitSurfaceEndsToTracks=false; continue; }
     if (key == "--no-uniform-width-filter") {config.uniformWidthFilterEnabled=false;continue;}
     if (key == "--uniform-width") {
       const QString value=i+1<args.size()?args[++i].toLower():QString();

@@ -32,8 +32,32 @@
 #include <limits>
 #include <vtkGenericOpenGLRenderWindow.h>
 #include <vtkRenderer.h>
+#include <pcl/conversions.h>
 
 namespace weld {
+namespace {
+pcl::PolygonMesh surfaceMesh(const BSplineSurfaceModel &model) {
+  pcl::PolygonMesh mesh;CloudT vertices;
+  for(const auto &patch:model.patches) {
+    if(!patch.valid())continue;
+    const int nu=std::max(32,std::min(512,8*patch.countU)),nv=96;
+    const auto begin=vertices.size();bool valid=true;
+    for(int i=0;i<=nu && valid;++i)for(int j=0;j<=nv;++j) {
+      Eigen::Vector3d p;
+      if(!patch.evaluate(double(i)/nu,double(j)/nv,p)) {valid=false;break;}
+      vertices.push_back(PointT(float(p.x()),float(p.y()),float(p.z())));
+    }
+    if(!valid) {vertices.resize(begin);continue;}
+    for(int i=0;i<nu;++i)for(int j=0;j<nv;++j) {
+      const auto a=static_cast<std::uint32_t>(begin+i*(nv+1)+j),b=a+nv+1;
+      pcl::Vertices first,second;
+      first.vertices={a,b,a+1};second.vertices={a+1,b,b+1};
+      mesh.polygons.push_back(std::move(first));mesh.polygons.push_back(std::move(second));
+    }
+  }
+  pcl::toPCLPointCloud2(vertices,mesh.cloud);return mesh;
+}
+}
 MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
   setWindowTitle(QStringLiteral("焊缝提取 · 独立算法参数"));
   resize(1280, 860);
@@ -58,6 +82,9 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 }
 void MainWindow::finishDetection(const DetectionRun &run) {
   result_ = run.result;
+  surfaceMeshes_[0]=surfaceMesh(result_.leftSurfaceModel);
+  surfaceMeshes_[1]=surfaceMesh(result_.rightSurfaceModel);
+  surfaceMeshes_[2]=surfaceMesh(result_.weldSurfaceModel);
   busy_ = false;
   parameters_->setEnabled(true);
   generateSurfaceModels_->setEnabled(true);
@@ -317,8 +344,12 @@ void MainWindow::buildUi() {
   form->addRow(QStringLiteral("统一宽度后滤波长度"),uniformWidthFilterLength_);
   trimEndpoints_ = new QCheckBox(QStringLiteral("首尾大幅变动处截断"),parameters_);
   trimEndpoints_->setObjectName("trimUnstableEndpoints");
-  trimEndpoints_->setToolTip(QStringLiteral("从稳定段向首尾检查方向变化和偏离量；连续异常达到确认长度时，去掉外侧尾段。两侧同步截断，保留中间真实弯曲。"));
-  inputVoxel_ = spin(0, 1000000000, .001, QStringLiteral("直接输入降采样 size，支持最多六位小数，0 关闭。单位与点云一致；数值越大，通常保留的点越少。有原始帧时，主体筛选和面输出使用采样点，轨迹恢复保留主体单元内的原始轮廓，帧几何不随采样改变；无帧号时各阶段使用采样点。较大的 size 仍可能改变主体范围。"));
+  trimEndpoints_->setToolTip(QStringLiteral("疑似尾段先检查实测侧壁脚，修正误跟踪到底面纹路的候选，再从稳定段检查方向变化和偏离量；连续异常达到确认长度时停止。左右分别判断。"));
+  limitSurfaceEnds_ = new QCheckBox(QStringLiteral("面随左右轨迹各自终点停止"),parameters_);
+  limitSurfaceEnds_->setObjectName("limitSurfaceEndsToTracks");
+  limitSurfaceEnds_->setToolTip(QStringLiteral("左右侧壁分别停在各自轨迹终点，底面沿两个终点之间的边界收口。取消后可提取轨迹终点之外仍有实测支持的面。"));
+  connect(limitSurfaceEnds_,&QCheckBox::toggled,this,[this] { invalidateResult(); });
+  inputVoxel_ = spin(0, 1000000000, .001, QStringLiteral("直接输入降采样 size，支持最多六位小数，0 关闭。主体分析使用采样点，面提取恢复主体范围内的原始密集点。有原始帧时，轨迹也恢复原始轮廓，帧几何不随采样改变；无帧号时轨迹检测使用采样点。较大的 size 仍可能改变主体范围。"));
   inputVoxel_->setObjectName("inputVoxelSize");
   inputVoxel_->setDecimals(6);
   inputVoxel_->setButtonSymbols(QAbstractSpinBox::NoButtons);
@@ -423,6 +454,7 @@ void MainWindow::buildUi() {
   extra->addRow(adaptiveSeamCount_);
   extra->addRow(QStringLiteral("双道宽度阈值"), doubleSeamWidth_);
   extra->addRow(trimEndpoints_);
+  extra->addRow(limitSurfaceEnds_);
   endpointAngle_=spin(1,89,1,QStringLiteral("首尾相邻两段轨迹的方向变化阈值（度），越小越早停止。"));
   endpointWindow_=spin(1,100,1,QStringLiteral("首尾检测的物理窗口长度，单位与点云一致。从中间参考段向两端查找持续异常，短轨迹不强行裁剪。"));
   endpointDeviation_=spin(.1,20,.1,QStringLiteral("允许首尾轨迹相对稳定趋势的变动范围；超出后还需满足转角和持续长度条件才会截断。单位与点云一致。"));
@@ -563,8 +595,12 @@ void MainWindow::buildUi() {
   showTracks_=layer(QStringLiteral("焊缝轨迹"),"showSeamTracks",nullptr,true,1,1);
   showCloud_=layer(QStringLiteral("叠加原始点云"),"showInputCloud",nullptr,false,2,0);
   showBody_=layer(QStringLiteral("叠加主体点云"),"showMainBody",nullptr,false,2,1);
+  showFittedSurfaces_=layer(QStringLiteral("B 样条实体曲面"),"showFittedSurfaces",nullptr,true,3,0);
+  showSurfacePoints_=layer(QStringLiteral("叠加实测面点云"),"showSurfacePoints",nullptr,false,3,1);
+  showFittedSurfaces_->setToolTip(QStringLiteral("显示拟合模型的三角网格；三个面的颜色开关同时控制对应曲面。未生成模型的面显示实测点云。"));
+  showSurfacePoints_->setToolTip(QStringLiteral("叠加提取出的实测点，与拟合曲面对照。补点仅用于拟合约束，不混入实测点云。"));
   auto *reset = new QPushButton(QStringLiteral("重置视角"), displayGroup);
-  view->addWidget(reset,3,0,1,2);
+  view->addWidget(reset,4,0,1,2);
   connect(reset, &QPushButton::clicked, this, [this] { refreshView(true); });
   resultLabel_ = new QLabel(QStringLiteral("尚未提取"), panel);
   resultLabel_->setWordWrap(true);
@@ -773,6 +809,7 @@ void MainWindow::applyConfig(const DetectorConfig &c) {
   floorEnabled_->setChecked(c.useLocalFloorConstraint);
   surfaceEnabled_->setChecked(c.useSurfaceRefinement);
   trimEndpoints_->setChecked(c.trimUnstableEndpoints);
+  limitSurfaceEnds_->setChecked(c.limitSurfaceEndsToTracks);
   endpointAngle_->setValue(c.endpointTrimAngleDegrees); endpointWindow_->setValue(c.endpointTrimWindow);
   endpointDeviation_->setValue(c.endpointTrimDeviation);
   endpointAngle_->setEnabled(c.trimUnstableEndpoints); endpointWindow_->setEnabled(c.trimUnstableEndpoints); endpointDeviation_->setEnabled(c.trimUnstableEndpoints);
@@ -864,6 +901,7 @@ DetectorConfig MainWindow::currentConfig() const {
   c.useLocalFloorConstraint = floorEnabled_->isChecked();
   c.useSurfaceRefinement = surfaceEnabled_->isChecked();
   c.trimUnstableEndpoints=trimEndpoints_->isChecked();
+  c.limitSurfaceEndsToTracks=limitSurfaceEnds_->isChecked();
   c.endpointTrimAngleDegrees=float(endpointAngle_->value()); c.endpointTrimWindow=float(endpointWindow_->value());
   c.endpointTrimDeviation=float(endpointDeviation_->value());
   c.finalSmoothingEnabled = finalSmoothing_->isChecked();
@@ -1100,15 +1138,23 @@ void MainWindow::refreshView(bool reset) {
     }
   }
   if (result_.ok()) {
-    auto surface=[&](const CloudT::Ptr &cloud,QCheckBox *toggle,const char *id,int r,int g,int b) {
-      if(!toggle->isChecked() || !cloud || cloud->empty())return;
+    auto surface=[&](const CloudT::Ptr &cloud,const pcl::PolygonMesh &mesh,QCheckBox *toggle,const char *id,int r,int g,int b) {
+      if(!toggle->isChecked())return;
+      if(showFittedSurfaces_->isChecked() && !mesh.polygons.empty()) {
+        const std::string meshId=std::string(id)+"_model";
+        viewer_->addPolygonMesh(mesh,meshId);
+        viewer_->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_COLOR,r/255.,g/255.,b/255.,meshId);
+        viewer_->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_OPACITY,.9,meshId);
+      }
+      if(!cloud || cloud->empty() || (!showSurfacePoints_->isChecked() &&
+          !(showFittedSurfaces_->isChecked() && mesh.polygons.empty())))return;
       pcl::visualization::PointCloudColorHandlerCustom<PointT> color(cloud,r,g,b);
       viewer_->addPointCloud<PointT>(cloud,color,id);
       viewer_->setPointCloudRenderingProperties(pcl::visualization::PCL_VISUALIZER_POINT_SIZE,2,id);
     };
-    surface(result_.leftSurface,showLeftSurface_,"left_surface",60,155,245);
-    surface(result_.rightSurface,showRightSurface_,"right_surface",245,145,45);
-    surface(result_.weldSurface,showWeldSurface_,"weld_surface",55,195,105);
+    surface(result_.leftSurface,surfaceMeshes_[0],showLeftSurface_,"left_surface",60,155,245);
+    surface(result_.rightSurface,surfaceMeshes_[1],showRightSurface_,"right_surface",245,145,45);
+    surface(result_.weldSurface,surfaceMeshes_[2],showWeldSurface_,"weld_surface",55,195,105);
   }
   if (result_.ok() && showTracks_->isChecked())
     for (int side = 0; side < 3; ++side) {

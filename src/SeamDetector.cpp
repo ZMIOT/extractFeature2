@@ -13,13 +13,13 @@
  * S00 输入检查/逐帧入口采样 -> H 船体主体提取 -> S01 有限点 -> S02 离群滤波 -> S03 体素降采样
  * 主体保护模式跳过二次滤波；debugFrameBatchSize>0 时只在 H、帧组 F 和最终结果暂停。
  * -> S04 纵向切片 -> S05 截面分箱 -> S06 三面结构候选 -> S07 局部折角
- * -> S08 保留主体 -> S09 成对路径优化 -> S10 内部短缺口插补
+ * -> S08 保留主体 -> S09 单侧路径优化 -> S10 内部短缺口插补
  * -> S11 曲线正则 -> S12 侧壁局部拟合 -> S13 高残差侧壁重拟合
  * -> S14 贴壁投影 -> S15 正方形底面拟合 -> S16 三约束交点 -> S17 输出。
  *
- * 关键约束：纵向站位固定；左右成对选取；没有可靠支撑就保留上一阶段结果；
+ * 关键约束：纵向站位固定；左右独立选取；没有可靠支撑就保留上一阶段结果；
  *           最终连续轨迹在候选保护后另行拟合，不再强制贴回逐帧局部面。
- * 阅读入口：detect -> collectFrameSlices/collectSlices -> retainMainSegment -> optimizePairedPaths
+ * 阅读入口：detect -> collectFrameSlices/collectSlices -> retainMainSegment -> optimizeSidePath
  * -> interpolateInternalGaps -> fillSideResult。单侧处理在 fillSideResult
  * 中展开。 debugFlag 开启时，界面/CLI 经 detectWithDebugViewer 在 GUI
  * 线程逐步显示 VTK。 算法只发布 DebugStep；窗口逻辑位于 SeamDebugViewer.cpp。
@@ -114,6 +114,7 @@ struct Slice {
   bool hasGeometry = false;
   bool featureDepthBoundary = false;
   std::vector<SurfacePair> pairs;
+  std::array<std::vector<Candidate>,2> sideCandidates;
 };
 
 // 二维剖面中的直线使用“单位方向 + 法向距离”表示。与 v=k*u+b 相比，
@@ -2085,7 +2086,8 @@ findSurfacePairs(const std::vector<ProfilePoint> &profile,
                  const std::array<HistoryPrediction, 2> &predictions,
                  std::array<ObservedWall,2> &wallTrack,
                  bool *hasGeometry, DebugSlice *debug,
-                 detail::CandidateExecutor &executor, bool fallbackPass = false) {
+                 detail::CandidateExecutor &executor, bool fallbackPass = false,
+                 std::array<std::vector<Candidate>,2> *independent = nullptr) {
   const auto previousWallTrack = wallTrack;
   const bool stableWallTurn = config.profileLocalizationMethod ==
       ProfileLocalizationMethod::CurvatureCandidates &&
@@ -2923,12 +2925,37 @@ findSurfacePairs(const std::vector<ProfilePoint> &profile,
       debug->fittedProfile.clear(); debug->fittedCurvature.clear(); debug->turnRegions.clear();
     }
     result = findSurfacePairs(profile, localizationProfile, fallback, predictions,
-                              wallTrack, hasGeometry, debug, executor, true);
+                              wallTrack, hasGeometry, debug, executor, true, independent);
     for (auto &pair : result) {
       pair.left.curvatureFallback = pair.right.curvatureFallback = true;
       if (pair.debug) pair.debug->source = "curve_line_fallback/" + pair.debug->source;
     }
     if (debug && !result.empty()) ++debug->gates["curve_line_fallback_accepted"];
+  }
+  if (independent && result.empty() && config.useProfileCurvature && !directCurveLine) {
+    const auto axes=transverseAxes(config.longitudinalAxis);
+    for (int side=0;side<2;++side) {
+      const auto &wall=walls[side];
+      if (!wall.line.valid || wall.line.rms>config.profileWallTolerance) continue;
+      for (const auto &turn:turns) {
+        const int opening=config.interiorOpeningDirection;
+        if (!nearObservedWall(turn,wall,config) || !opening ||
+            turn.angle*opening<config.minLocalSurfaceAngleDegrees*kPi/180.f ||
+            wall.line.direction.y()*opening*(side?1:-1)<.35f ||
+            (turn.point.x()-bottomMidpoint)*(side?1:-1)<=0 ||
+            std::fabs(wall.line.normal.dot(turn.point)-wall.line.offset)>config.profileWallTolerance) continue;
+        Candidate c;
+        c.curvatureFallback=fallbackPass;
+        c.point=profile.front().point;
+        c.point.data[axes[0]]=turn.point.x(); c.point.data[axes[1]]=turn.point.y();
+        c.hasWall=c.trackedWall=c.fromLocalCorner=true;
+        c.wallNormal=c.trackedNormal=wall.line.normal;
+        c.wallOffset=c.trackedOffset=wall.line.offset;c.wallRms=wall.line.rms;
+        c.profileCurvature=turn.curvature;
+        c.feature=clamp01(.5f+.5f*std::fabs(turn.angle)/(.5f*kPi));
+        (*independent)[side].push_back(c);
+      }
+    }
   }
   if (hasGeometry) {
     *hasGeometry = !result.empty();
@@ -3319,12 +3346,12 @@ bool prepareFrameSections(const CloudT::ConstPtr &input,
 }
 
 void restoreOriginalFrameGeometry(SeamResult &result,
-                                  const std::vector<int> &frameIds,
+                                  const std::array<std::vector<int>,2> &frameIds,
                                   const std::vector<FrameProjection> &planes,
                                   Axis axis) {
   result.leftFrameIndices.clear();
   result.rightFrameIndices.clear();
-  auto restore = [&](CloudT &cloud, std::vector<int> &ids) {
+  auto restore = [&](CloudT &cloud, std::vector<int> &ids, const std::vector<int> &frameIds) {
     const std::size_t count = std::min(cloud.size(), frameIds.size());
     ids.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
@@ -3338,8 +3365,8 @@ void restoreOriginalFrameGeometry(SeamResult &result,
       cloud[i] = restoreFramePoint(cloud[i], *found, axis);
     }
   };
-  restore(*result.leftSeam, result.leftFrameIndices);
-  restore(*result.rightSeam, result.rightFrameIndices);
+  restore(*result.leftSeam, result.leftFrameIndices, frameIds[0]);
+  restore(*result.rightSeam, result.rightFrameIndices, frameIds[1]);
 }
 
 void scoreSurfacePairs(std::vector<SurfacePair> &pairs,
@@ -3640,10 +3667,11 @@ void appendSlice(std::vector<Slice> &slices, const std::vector<PointT> &points,
       return;
     }
   }
+  std::array<std::vector<Candidate>,2> independent;
   std::vector<SurfacePair> pairs =
-      findSurfacePairs(profile, localizationProfile, config, predictions, wallTrack, &hasGeometry, debugSlice, executor);
+      findSurfacePairs(profile, localizationProfile, config, predictions, wallTrack, &hasGeometry, debugSlice, executor, false, &independent);
   publishPairStep(debug, pairs, station);
-  if (pairs.empty()) {
+  if (pairs.empty() && independent[0].empty() && independent[1].empty()) {
     if (debugSlice)
       debugSlice->noCandidateReason =
           describeNoCandidateReason(*debugSlice, config);
@@ -3652,9 +3680,26 @@ void appendSlice(std::vector<Slice> &slices, const std::vector<PointT> &points,
 
   scoreSurfacePairs(pairs, predictions, config);
   Slice slice;
+  for (int side=0;side<2;++side) {
+    auto &candidates=independent[side];
+    for (const auto &pair:pairs) {
+      const auto &c=side?pair.right:pair.left;
+      if (std::none_of(candidates.begin(),candidates.end(),[&](const Candidate &other) {
+            return transverseDistance(c.point,other.point,config.longitudinalAxis)<1.e-4f;
+          })) candidates.push_back(c);
+    }
+    for (auto &c:candidates) {
+      std::vector<SurfacePair> scoring(1);scoring[0].left=scoring[0].right=c;
+      scoreSurfacePairs(scoring,predictions,config);
+      c=side?scoring[0].right:scoring[0].left;
+    }
+  }
+  slice.sideCandidates=std::move(independent);
+  hasGeometry=hasGeometry || (pairs.empty() &&
+      (!slice.sideCandidates[0].empty() || !slice.sideCandidates[1].empty()));
   if (config.uniformWidthEnabled) {
     slice.widthSection.station=station;
-    slice.widthSection.bottomCenterU=pairs.front().bottomMidpointU;
+    slice.widthSection.bottomCenterU=pairs.empty()?0:pairs.front().bottomMidpointU;
     const auto &source=localizationProfile.empty()?profile:localizationProfile;
     // Retain only the connected measured contour containing the bottom;
     // neither missing samples nor a shallow-feature boundary are extrapolated.
@@ -3693,6 +3738,8 @@ void appendSlice(std::vector<Slice> &slices, const std::vector<PointT> &points,
       debugSlice->sourceCandidates[0].push_back(pair.left.point);
       debugSlice->sourceCandidates[1].push_back(pair.right.point);
     }
+    if(pairs.empty())for(int side=0;side<2;++side)
+      for(const auto &candidate:slice.sideCandidates[side])debugSlice->sourceCandidates[side].push_back(candidate.point);
   }
   slice.station = station;
   slice.frameIndex = frameIndex;
@@ -3935,31 +3982,18 @@ collectFrameSlices(const CloudT &cloud,
   return slices;
 }
 
-// Dense scans can miss more than three frames over a very short physical
-// interval. Reconnect only independently observed, compatible wall pairs.
-bool supportedPairGap(const Candidate &al,const Candidate &ar,
-                      const Candidate &bl,const Candidate &br,float gap,
-                      const DetectorConfig &config) {
+// Bridge a short measured gap using only this wall's support and direction.
+bool supportedSideGap(const Candidate &a,const Candidate &b,float gap,const DetectorConfig &config) {
   const float scale=profileGeometryScale(config);
-  if (!config.useProfileCurvature || gap<=0 || gap>2*scale) return false;
-  const int u=transverseAxes(config.longitudinalAxis)[0];
-  if (std::fabs((br.point.data[u]-bl.point.data[u])-(ar.point.data[u]-al.point.data[u]))>2*scale) return false;
-  for (const auto &pair:{std::make_pair(&al,&bl),std::make_pair(&ar,&br)}) {
-    if (!pair.first->trackedWall || !pair.second->trackedWall ||
-        // Curve tangents at a wavy floor junction can rotate noticeably over
-        // a handful of missing dense-scan frames even when the two measured
-        // junctions and the groove width remain continuous. Keep a direction
-        // check, but let the position/width gates carry the short-gap test.
-        std::fabs(pair.first->trackedNormal.dot(pair.second->trackedNormal))<.75f ||
-        transverseDistance(pair.first->point,pair.second->point,config.longitudinalAxis)>2*scale+2*gap) return false;
-  }
-  return true;
+  return config.useProfileCurvature && gap>0 && gap<=2*scale && a.trackedWall && b.trackedWall &&
+      std::fabs(a.trackedNormal.dot(b.trackedNormal))>=.75f &&
+      transverseDistance(a.point,b.point,config.longitudinalAxis)<=2*scale+2*gap;
 }
 
 std::size_t retainMainSegment(std::vector<Slice> &slices,
                               const DetectorConfig &config,
-                              bool hasBothHistories, DebugTrace *debug) {
-  // 三面模型偶尔会在光滑上表面产生一两个孤立候选。焊缝应沿纵向形成
+                              bool hasBothHistories, DebugTrace *debug, int side) {
+  // 每一侧分别选择有效锚点最多的连续段。焊缝应沿纵向形成
   // 连续主体，因此按“当前几何锚点”分段，只保留锚点最多的连续段。历史可
   // 在末端提供少量只参与优化的前视点，但最终输出仍严格截在几何锚点内。
   // S08 根据有效几何锚点选取主体连续段，避免把首尾圆滑上表面误当成焊缝。
@@ -3973,7 +4007,7 @@ std::size_t retainMainSegment(std::vector<Slice> &slices,
     std::vector<std::size_t> depthBoundaries(slices.size()+1, 0);
     for (std::size_t i = 0; i < slices.size(); ++i) {
       depthBoundaries[i+1] = depthBoundaries[i] + (slices[i].featureDepthBoundary ? 1 : 0);
-      if (slices[i].hasGeometry) {
+      if (slices[i].hasGeometry && !slices[i].sideCandidates[side].empty()) {
         anchors.push_back(i);
       }
     }
@@ -3993,8 +4027,8 @@ std::size_t retainMainSegment(std::vector<Slice> &slices,
                 maximumSegmentGap + 0.25f * config.sliceStep;
         if (segmentEnds && !crossesDepthBoundary && i<anchors.size()) {
           const auto &a=slices[anchors[i-1]],&b=slices[anchors[i]];
-          for (const auto &pa:a.pairs) for (const auto &pb:b.pairs)
-            if (supportedPairGap(pa.left,pa.right,pb.left,pb.right,b.station-a.station,config)) segmentEnds=false;
+          for (const auto &ca:a.sideCandidates[side]) for (const auto &cb:b.sideCandidates[side])
+            if (supportedSideGap(ca,cb,b.station-a.station,config)) segmentEnds=false;
         }
         if (!segmentEnds) {
           continue;
@@ -4028,7 +4062,8 @@ std::size_t retainMainSegment(std::vector<Slice> &slices,
     }
     // With no geometric anchors an entirely planar input only contains
     // boundary markers; they must never reach path optimization as nodes.
-    if (anchors.empty() && depthBoundaries.back() > 0) slices.clear();
+    if (anchors.empty()) slices.clear();
+    slices.erase(std::remove_if(slices.begin(),slices.end(),[&](const Slice &s) {return s.sideCandidates[side].empty();}),slices.end());
   }
 
   if (debug) {
@@ -4043,126 +4078,47 @@ std::size_t retainMainSegment(std::vector<Slice> &slices,
   return outputSliceCount;
 }
 
-float nodeCost(const SurfacePair &pair) {
-  return pair.left.nodeCost[0] + pair.right.nodeCost[1];
+float sideAllowedJump(const Candidate &a,const Candidate &b,float gap,const DetectorConfig &config) {
+  float allowed=config.maxTransitionDistance*std::max(1.f,gap/config.sliceStep);
+  if(a.emergingProfile || b.emergingProfile) {
+    const float scale=profileGeometryScale(config);
+    allowed=std::min(allowed,a.emergingProfile && b.emergingProfile?std::max(2*scale,5*gap):std::max(3*scale,6*gap));
+  }
+  return std::max(1.e-4f,allowed);
 }
-
-bool isEmergingProfilePair(const SurfacePair &pair) {
-  return pair.left.emergingProfile && pair.right.emergingProfile;
+float sideTransitionCost(const Candidate &a,const Candidate &b,float gap,const DetectorConfig &config) {
+  const float allowed=sideAllowedJump(a,b,gap,config);
+  const float distance=transverseOffsetDistance(b,a,config.longitudinalAxis);
+  const float normalized=distance/std::max(1.f,allowed);
+  return config.smoothnessWeight*normalized*normalized+20*std::max(0.f,distance-allowed)/allowed;
 }
-
-float pairAllowedJump(const SurfacePair &previousPair,
-                      const SurfacePair &currentPair, float stationGap,
-                      const DetectorConfig &config) {
-  float allowed = config.maxTransitionDistance *
-                  std::max(1.0f, stationGap / config.sliceStep);
-  const bool previousEmerging = isEmergingProfilePair(previousPair);
-  const bool currentEmerging = isEmergingProfilePair(currentPair);
-  if (previousEmerging || currentEmerging) {
-    const float scale = profileGeometryScale(config);
-    const float emergingLimit =
-        (previousEmerging && currentEmerging)
-            ? std::max(2.f * scale, 5.f * stationGap)
-            : std::max(3.f * scale, 6.f * stationGap);
-    allowed = std::min(allowed, emergingLimit);
-  }
-  return allowed;
-}
-
-float pairTransitionCost(const SurfacePair &previousPair,
-                         const SurfacePair &currentPair, float stationGap,
-                         const DetectorConfig &config) {
-  const int sideAxis = transverseAxes(config.longitudinalAxis)[0];
-  const float allowedJump = pairAllowedJump(
-      previousPair, currentPair, stationGap, config);
-  const float leftDistance = transverseOffsetDistance(
-      currentPair.left, previousPair.left, config.longitudinalAxis);
-  const float rightDistance = transverseOffsetDistance(
-      currentPair.right, previousPair.right, config.longitudinalAxis);
-  const float leftNormalized = leftDistance / std::max(1.0f, allowedJump);
-  const float rightNormalized = rightDistance / std::max(1.0f, allowedJump);
-  float transition =
-      config.smoothnessWeight *
-      (leftNormalized * leftNormalized + rightNormalized * rightNormalized);
-  if (leftDistance > allowedJump) {
-    transition += 20.0f * (leftDistance - allowedJump) / allowedJump;
-  }
-  if (rightDistance > allowedJump) {
-    transition += 20.0f * (rightDistance - allowedJump) / allowedJump;
-  }
-  const float currentWidth = component(currentPair.right.point, sideAxis) -
-                             component(currentPair.left.point, sideAxis);
-  const float previousWidth = component(previousPair.right.point, sideAxis) -
-                              component(previousPair.left.point, sideAxis);
-  const float widthChange =
-      (currentWidth - previousWidth) / std::max(1.0f, allowedJump);
-  return transition +
-         0.75f * config.smoothnessWeight * widthChange * widthChange;
-}
-
-float tangentPredictionCost(const SurfacePair &beforePrevious,
-                            const SurfacePair &previous,
-                            const SurfacePair &current, float previousGap,
-                            float currentGap, const DetectorConfig &config) {
-  const float ratio = currentGap / std::max(1.0e-4f, previousGap);
-  auto predictionError = [&](const Candidate &first, const Candidate &second,
-                             const Candidate &third) {
-    Eigen::Vector3f predicted =
-        second.localOffset + (second.localOffset - first.localOffset) * ratio;
-    Eigen::Vector3f difference = third.localOffset - predicted;
-    difference[static_cast<int>(config.longitudinalAxis)] = 0.0f;
-    return difference.norm();
-  };
-  const float leftError =
-      predictionError(beforePrevious.left, previous.left, current.left);
-  const float rightError =
-      predictionError(beforePrevious.right, previous.right, current.right);
-  const float allowedJump = std::min(
-      pairAllowedJump(previous, current, currentGap, config),
-      pairAllowedJump(beforePrevious, previous, previousGap, config));
-  // 预测误差尺度小于单步最大位移：斜率可以很大，但斜率不应突然变化。
-  const float curvatureScale = std::max(1.0f, 0.35f * allowedJump);
-  const float leftNormalized = leftError / curvatureScale;
-  const float rightNormalized = rightError / curvatureScale;
-  float cost = config.curvatureWeight * (leftNormalized * leftNormalized +
-                                         rightNormalized * rightNormalized);
-  const bool curvature = config.profileLocalizationMethod == ProfileLocalizationMethod::CurvatureCandidates;
-  const auto &search = curvature ? config.curvatureSearch : config.curveLineFallback.search;
-  if (config.useProfileCurvature && search.multiCandidates &&
-      (curvature || current.left.curvatureFallback || previous.left.curvatureFallback ||
-       beforePrevious.left.curvatureFallback)) {
-    // Compare geometrically supported alternatives at the localization scale,
-    // rather than the much larger maximum permitted inter-frame jump.
-    const float scale = std::max(.25f, curvature ? config.profileWallTolerance :
-                                               config.curveLineFallback.wallTolerance);
-    auto huber = [](float x) { return x <= 1.f ? x*x : 2.f*x-1.f; };
-    cost += search.continuityWeight * (huber(leftError/scale) + huber(rightError/scale));
-  }
-  if (leftError > allowedJump) {
-    cost += 30.0f * (leftError - allowedJump) / std::max(1.0f, allowedJump);
-  }
-  if (rightError > allowedJump) {
-    cost += 30.0f * (rightError - allowedJump) / std::max(1.0f, allowedJump);
+float sideTangentCost(const Candidate &a,const Candidate &b,const Candidate &c,float previousGap,float gap,const DetectorConfig &config) {
+  Eigen::Vector3f delta=c.localOffset-(b.localOffset+(b.localOffset-a.localOffset)*(gap/std::max(1.e-4f,previousGap)));
+  delta[int(config.longitudinalAxis)]=0;
+  const float error=delta.norm();
+  const float allowed=std::min(sideAllowedJump(a,b,previousGap,config),sideAllowedJump(b,c,gap,config));
+  const float scale=std::max(1.f,.35f*allowed);
+  float cost=config.curvatureWeight*error*error/(scale*scale)+30*std::max(0.f,error-allowed)/std::max(1.f,allowed);
+  const bool curvature=config.profileLocalizationMethod==ProfileLocalizationMethod::CurvatureCandidates;
+  const auto &search=curvature?config.curvatureSearch:config.curveLineFallback.search;
+  if(config.useProfileCurvature && search.multiCandidates && (curvature || a.curvatureFallback || b.curvatureFallback || c.curvatureFallback)) {
+    const float x=error/std::max(.25f,curvature?config.profileWallTolerance:config.curveLineFallback.wallTolerance);
+    cost+=search.continuityWeight*(x<=1?x*x:2*x-1);
   }
   return cost;
 }
 
-bool optimizePairedPaths(const std::vector<Slice> &slices,
+bool optimizeSidePath(const std::vector<Slice> &slices,
                          const DetectorConfig &config, DebugTrace *debug,
-                         std::vector<Candidate> &leftPath,
-                         std::vector<Candidate> &rightPath,
+                         int side, std::vector<Candidate> &path,
                          std::string &error) {
-  // 状态保存连续两个截面的候选编号。这样不仅能限制相邻距离，还能用
-  // 前两点的切线预测当前点；连续陡坡可以通过，突然换到另一块面会产生
-  // 很大的预测残差。左右交点仍必须来自同一套截面结构候选。
-  // S09 左右成对的二阶动态规划。
-  // 状态=(前一截面候选编号, 当前截面候选编号)，从更早一片转移。
-  // 总代价=特征节点代价+左右位移/宽度变化代价+前两点切线预测误差。
-  // stateParents 记录最优前驱；回溯 selected 后得到 leftPath/rightPath。
-  // 成对优化防止左右焊缝来自互不一致的截面结构。
+  // A state contains two consecutive candidates of ONE side only.
+  // A one-time seed-order tie break preserves equally supported feature identities
+  // against roundoff; no shape/width bonus accumulates along the trajectory.
+  if (slices.size()<2) { for(const auto &s:slices) path.push_back(s.sideCandidates[side].front());return true; }
   std::vector<std::vector<int>> stateParents(slices.size());
-  const std::size_t firstCount = slices[0].pairs.size();
-  const std::size_t secondCount = slices[1].pairs.size();
+  const std::size_t firstCount = slices[0].sideCandidates[side].size();
+  const std::size_t secondCount = slices[1].sideCandidates[side].size();
   std::vector<float> stateCosts(firstCount * secondCount,
                                 std::numeric_limits<float>::infinity());
   stateParents[1].assign(firstCount * secondCount, -1);
@@ -4170,17 +4126,17 @@ bool optimizePairedPaths(const std::vector<Slice> &slices,
   for (std::size_t first = 0; first < firstCount; ++first) {
     for (std::size_t second = 0; second < secondCount; ++second) {
       stateCosts[first * secondCount + second] =
-          nodeCost(slices[0].pairs[first]) +
-          pairTransitionCost(slices[0].pairs[first], slices[1].pairs[second],
+          slices[0].sideCandidates[side][first].nodeCost[side] + 1.e-3f*float(first) +
+          sideTransitionCost(slices[0].sideCandidates[side][first], slices[1].sideCandidates[side][second],
                              firstGap, config) +
-          nodeCost(slices[1].pairs[second]);
+          slices[1].sideCandidates[side][second].nodeCost[side];
     }
   }
 
   for (std::size_t i = 2; i < slices.size(); ++i) {
-    const std::size_t beforeCount = slices[i - 2].pairs.size();
-    const std::size_t previousCount = slices[i - 1].pairs.size();
-    const std::size_t currentCount = slices[i].pairs.size();
+    const std::size_t beforeCount = slices[i - 2].sideCandidates[side].size();
+    const std::size_t previousCount = slices[i - 1].sideCandidates[side].size();
+    const std::size_t currentCount = slices[i].sideCandidates[side].size();
     std::vector<float> nextCosts(previousCount * currentCount,
                                  std::numeric_limits<float>::infinity());
     stateParents[i].assign(previousCount * currentCount, -1);
@@ -4189,9 +4145,9 @@ bool optimizePairedPaths(const std::vector<Slice> &slices,
     for (std::size_t previous = 0; previous < previousCount; ++previous) {
       for (std::size_t current = 0; current < currentCount; ++current) {
         const float base =
-            pairTransitionCost(slices[i - 1].pairs[previous],
-                               slices[i].pairs[current], currentGap, config) +
-            nodeCost(slices[i].pairs[current]);
+            sideTransitionCost(slices[i - 1].sideCandidates[side][previous],
+                               slices[i].sideCandidates[side][current], currentGap, config) +
+            slices[i].sideCandidates[side][current].nodeCost[side];
         const std::size_t state = previous * currentCount + current;
         for (std::size_t before = 0; before < beforeCount; ++before) {
           const float preceding = stateCosts[before * previousCount + previous];
@@ -4200,9 +4156,9 @@ bool optimizePairedPaths(const std::vector<Slice> &slices,
           }
           const float total =
               preceding + base +
-              tangentPredictionCost(
-                  slices[i - 2].pairs[before], slices[i - 1].pairs[previous],
-                  slices[i].pairs[current], previousGap, currentGap, config);
+              sideTangentCost(
+                  slices[i - 2].sideCandidates[side][before], slices[i - 1].sideCandidates[side][previous],
+                  slices[i].sideCandidates[side][current], previousGap, currentGap, config);
           if (total < nextCosts[state]) {
             nextCosts[state] = total;
             stateParents[i][state] = static_cast<int>(before);
@@ -4215,22 +4171,21 @@ bool optimizePairedPaths(const std::vector<Slice> &slices,
 
   const auto last = std::min_element(stateCosts.begin(), stateCosts.end());
   if (last == stateCosts.end() || !std::isfinite(*last)) {
-    error = "No continuous left/right seam pair could be formed.";
+    error = "No continuous single-side trajectory could be formed.";
     return false;
   }
 
-  leftPath.resize(slices.size());
+  path.resize(slices.size());
   if (debug)
     debug->optimalCost = *last;
-  rightPath.resize(slices.size());
   std::vector<int> selected(slices.size(), -1);
-  const std::size_t lastCurrentCount = slices.back().pairs.size();
+  const std::size_t lastCurrentCount = slices.back().sideCandidates[side].size();
   const std::size_t lastState =
       static_cast<std::size_t>(std::distance(stateCosts.begin(), last));
   selected[slices.size() - 2] = static_cast<int>(lastState / lastCurrentCount);
   selected[slices.size() - 1] = static_cast<int>(lastState % lastCurrentCount);
   for (std::size_t i = slices.size() - 1; i >= 2; --i) {
-    const std::size_t currentCount = slices[i].pairs.size();
+    const std::size_t currentCount = slices[i].sideCandidates[side].size();
     const std::size_t state =
         static_cast<std::size_t>(selected[i - 1]) * currentCount +
         static_cast<std::size_t>(selected[i]);
@@ -4238,33 +4193,19 @@ bool optimizePairedPaths(const std::vector<Slice> &slices,
   }
   for (std::size_t i = 0; i < slices.size(); ++i) {
     if (selected[i] < 0 ||
-        selected[i] >= static_cast<int>(slices[i].pairs.size())) {
-      error = "Internal paired-path backtracking failed.";
+        selected[i] >= static_cast<int>(slices[i].sideCandidates[side].size())) {
+      error = "Internal single-side path backtracking failed.";
       return false;
     }
-    const SurfacePair &pair =
-        slices[i].pairs[static_cast<std::size_t>(selected[i])];
-    if (debug) {
-      auto &d = debug->slices[slices[i].debugIndex];
-      d.selected = selected[i];
-      d.selectedNodeCost = nodeCost(pair);
-      if (i > 0)
-        d.transitionCost = pairTransitionCost(
-            slices[i - 1].pairs[selected[i - 1]], pair,
-            slices[i].station - slices[i - 1].station, config);
-      if (i > 1)
-        d.tangentCost = tangentPredictionCost(
-            slices[i - 2].pairs[selected[i - 2]],
-            slices[i - 1].pairs[selected[i - 1]], pair,
-            slices[i - 1].station - slices[i - 2].station,
-            slices[i].station - slices[i - 1].station, config);
+    path[i]=slices[i].sideCandidates[side][selected[i]];
+    path[i].point.data[int(config.longitudinalAxis)]=slices[i].station;
+    if(debug && side==0) {
+      auto &d=debug->slices[slices[i].debugIndex];
+      for(std::size_t j=0;j<slices[i].pairs.size();++j)
+        if(transverseDistance(slices[i].pairs[j].left.point,path[i].point,config.longitudinalAxis)<1.e-4f) {
+          d.selected=int(j);break;
+        }
     }
-    leftPath[i] = pair.left;
-    rightPath[i] = pair.right;
-    leftPath[i].point.data[static_cast<int>(config.longitudinalAxis)] =
-        slices[i].station;
-    rightPath[i].point.data[static_cast<int>(config.longitudinalAxis)] =
-        slices[i].station;
   }
   return true;
 }
@@ -4314,164 +4255,44 @@ Candidate continuityCandidate(const std::vector<ProfilePoint> &profile,
   return candidate;
 }
 
-void interpolateInternalGaps(const CloudT &cloud, const StationRange &range,
-                             const std::vector<Slice> &slices,
-                             const DetectorConfig &config,
-                             std::vector<Candidate> &leftPath,
-                             std::vector<Candidate> &rightPath,
-                             DebugTrace *debug,
-                             const std::vector<ScanFrameRange> *frames = nullptr,
-                             std::vector<int> *outputFrameIds = nullptr) {
-  // S10 只在前后可靠锚点之间填补少量内部缺口。
-  // U 由前后路径插值，V 取本次截面附近实测高度；首尾和长缺口不补。
-  // 默认最多补 3 个站位，并继续保持左右最小间距。
-  const float minimum = range.minimum, maximum = range.maximum;
-  const float halfThickness = .5f * config.sliceThickness;
-  auto gapSupported=[&](std::size_t anchor) {
-    if (anchor==0 || anchor>=slices.size()) return false;
+void interpolateSideGaps(const CloudT &cloud,const StationRange &range,
+    const std::vector<Slice> &slices,const DetectorConfig &config,std::vector<Candidate> &path,
+    const std::vector<ScanFrameRange> *frames,std::vector<int> &ids) {
+  ids.clear();if(path.empty())return;
+  std::vector<Candidate> complete;std::size_t anchor=0;
+  auto append=[&](float station,int frameId,const std::vector<PointT> &points) {
+    if(anchor<slices.size() && std::fabs(slices[anchor].station-station)<=.25f*config.sliceStep) {
+      complete.push_back(path[anchor++]);if(frames)ids.push_back(frameId);return;
+    }
+    if(!anchor || anchor>=slices.size())return;
     const float gap=slices[anchor].station-slices[anchor-1].station;
-    return gap<=float(config.maxInterpolatedGapStations+1)*config.sliceStep ||
-        supportedPairGap(leftPath[anchor-1],rightPath[anchor-1],leftPath[anchor],rightPath[anchor],gap,config);
+    const auto &a=path[anchor-1],&b=path[anchor];
+    if(gap>(config.maxInterpolatedGapStations+1)*config.sliceStep && !supportedSideGap(a,b,gap,config))return;
+    const auto profile=makeProfile(points,config.longitudinalAxis,config,station,config.longitudinalDetrendMinSpan);
+    if(profile.empty())return;
+    auto candidate=continuityCandidate(profile,station,predictTransverseCoordinate(path,station,config),config);
+    if(gap>(config.maxInterpolatedGapStations+1)*config.sliceStep) {
+      const float t=(station-slices[anchor-1].station)/gap,sign=a.trackedNormal.dot(b.trackedNormal)<0?-1.f:1.f;
+      Eigen::Vector2f normal=(1-t)*a.trackedNormal+t*sign*b.trackedNormal;
+      if(normal.norm()<.9f)return;
+      const float offset=((1-t)*a.trackedOffset+t*sign*b.trackedOffset)/normal.norm();normal.normalize();
+      const auto axes=transverseAxes(config.longitudinalAxis);
+      if(std::fabs(normal.dot(Eigen::Vector2f(candidate.point.data[axes[0]],candidate.point.data[axes[1]]))-offset)>config.profileWallTolerance)return;
+      candidate.trackedWall=true;candidate.trackedNormal=normal;candidate.trackedOffset=offset;
+    }
+    complete.push_back(candidate);if(frames)ids.push_back(frameId);
   };
-  auto supportedMeasurements=[&](Candidate &left,Candidate &right,float station,std::size_t anchor) {
-    const float first=slices[anchor-1].station,last=slices[anchor].station;
-    if (last-first<=float(config.maxInterpolatedGapStations+1)*config.sliceStep) return true;
-    const float t=(station-first)/(last-first);
-    const auto axes=transverseAxes(config.longitudinalAxis);
-    for (int side=0;side<2;++side) {
-      auto &c=side ? right : left;
-      const auto &path=side ? rightPath : leftPath;
-      const auto &a=path[anchor-1],&b=path[anchor];
-      const float sign=a.trackedNormal.dot(b.trackedNormal)<0 ? -1.f : 1.f;
-      const Eigen::Vector2f normal=(1-t)*a.trackedNormal+t*sign*b.trackedNormal;
-      if (normal.norm()<.9f) return false;
-      const float offset=((1-t)*a.trackedOffset+t*sign*b.trackedOffset)/normal.norm();
-      const Eigen::Vector2f n=normal.normalized(),p(c.point.data[axes[0]],c.point.data[axes[1]]);
-      // The new point's height comes from this frame, not an extrapolated tail.
-      if (std::fabs(n.dot(p)-offset)>config.profileWallTolerance) return false;
-      c.trackedWall=true;c.trackedNormal=n;c.trackedOffset=offset;
-    }
-    return true;
-  };
-  if (frames) {
-    std::vector<Candidate> completeLeft, completeRight;
-    std::size_t anchor = 0;
-    if (outputFrameIds)
-      outputFrameIds->clear();
-    for (const auto &frame : *frames) {
-      const float station =
-          coordinate(cloud[frame.begin], config.longitudinalAxis);
-      if (anchor < slices.size() &&
-          std::fabs(slices[anchor].station - station) <=
-              .25f * config.sliceStep) {
-        completeLeft.push_back(leftPath[anchor]);
-        completeRight.push_back(rightPath[anchor]);
-        if (outputFrameIds)
-          outputFrameIds->push_back(frame.frameIndex);
-        ++anchor;
-        continue;
-      }
-      if (!gapSupported(anchor))
-        continue;
-      std::vector<PointT> points(cloud.begin() + frame.begin,
-                                 cloud.begin() + frame.begin + frame.count);
-      const auto profile =
-          makeProfile(points, config.longitudinalAxis, config, station,
-                      config.longitudinalDetrendMinSpan);
-      if (profile.empty())
-        continue;
-      float predictedLeft =
-          predictTransverseCoordinate(leftPath, station, config);
-      float predictedRight =
-          predictTransverseCoordinate(rightPath, station, config);
-      if (predictedRight - predictedLeft < config.minSeamSeparation) {
-        const float center = .5f * (predictedLeft + predictedRight);
-        predictedLeft = center - .5f * config.minSeamSeparation;
-        predictedRight = center + .5f * config.minSeamSeparation;
-      }
-      auto left=continuityCandidate(profile,station,predictedLeft,config);
-      auto right=continuityCandidate(profile,station,predictedRight,config);
-      if (!supportedMeasurements(left,right,station,anchor)) continue;
-      completeLeft.push_back(left);completeRight.push_back(right);
-      if (outputFrameIds)
-        outputFrameIds->push_back(frame.frameIndex);
-    }
-    leftPath = std::move(completeLeft);
-    rightPath = std::move(completeRight);
-    if (debug) {
-      for (const auto &c : leftPath)
-        debug->interpolatedPath[0].push_back(c.point);
-      for (const auto &c : rightPath)
-        debug->interpolatedPath[1].push_back(c.point);
-      debug->pathComplete = true;
-      publishPathStep(debug, "S10 内部短缺口插补", leftPath, rightPath);
-    }
-    return;
+  if(frames) for(const auto &frame:*frames) {
+    const float station=coordinate(cloud[frame.begin],config.longitudinalAxis);
+    if(station<slices.front().station-.25f*config.sliceStep || station>slices.back().station+.25f*config.sliceStep)continue;
+    append(station,frame.frameIndex,std::vector<PointT>(cloud.begin()+frame.begin,cloud.begin()+frame.begin+frame.count));
+  } else for(float station=range.minimum+.5f*config.sliceThickness;station<=range.maximum-.5f*config.sliceThickness+.25f*config.sliceStep;station+=config.sliceStep) {
+    std::vector<PointT> points;
+    if(anchor<slices.size() && std::fabs(slices[anchor].station-station)>.25f*config.sliceStep)
+      for(const auto &p:cloud)if(std::fabs(coordinate(p,config.longitudinalAxis)-station)<=.5f*config.sliceThickness)points.push_back(p);
+    append(station,-1,points);
   }
-  // 只填补两个可靠锚点之间的少量漏检站位。首尾贴着弧形上表面的区段
-  // 保持为空，不再为了视觉连续而生成实际上并不存在的焊缝。
-  if (!leftPath.empty() && !rightPath.empty()) {
-    std::vector<Candidate> completeLeft;
-    std::vector<Candidate> completeRight;
-    std::size_t anchor = 0;
-    for (float station = minimum + halfThickness;
-         station <= maximum - halfThickness + 0.25f * config.sliceStep;
-         station += config.sliceStep) {
-      if (anchor < slices.size() &&
-          std::fabs(slices[anchor].station - station) <=
-              0.25f * config.sliceStep) {
-        completeLeft.push_back(leftPath[anchor]);
-        completeRight.push_back(rightPath[anchor]);
-        ++anchor;
-        continue;
-      }
-
-      // 没有前后两个三面交线锚点时属于首尾弱特征区，直接不输出。内部
-      // 缺口过长也不跨越，防止轨迹再次沿着弧形上表面延伸。
-      if (!gapSupported(anchor)) {
-        continue;
-      }
-
-      std::vector<PointT> stationPoints;
-      for (const PointT &point : cloud) {
-        if (std::fabs(coordinate(point, config.longitudinalAxis) - station) <=
-            halfThickness) {
-          stationPoints.push_back(point);
-        }
-      }
-      const std::vector<ProfilePoint> profile = makeProfile(
-          stationPoints, config.longitudinalAxis, config, station,
-          config.longitudinalDetrendMinSpan);
-      if (profile.empty()) {
-        continue;
-      }
-      float predictedLeft =
-          predictTransverseCoordinate(leftPath, station, config);
-      float predictedRight =
-          predictTransverseCoordinate(rightPath, station, config);
-      if (predictedRight - predictedLeft < config.minSeamSeparation) {
-        // 短缺口插值仍保持左右最小间距，避免两条焊缝在缺口中合并。
-        const float center = 0.5f * (predictedLeft + predictedRight);
-        predictedLeft = center - 0.5f * config.minSeamSeparation;
-        predictedRight = center + 0.5f * config.minSeamSeparation;
-      }
-      auto left=continuityCandidate(profile,station,predictedLeft,config);
-      auto right=continuityCandidate(profile,station,predictedRight,config);
-      if (!supportedMeasurements(left,right,station,anchor)) continue;
-      completeLeft.push_back(left);completeRight.push_back(right);
-    }
-    leftPath = std::move(completeLeft);
-    rightPath = std::move(completeRight);
-  }
-
-  if (debug) {
-    for (const auto &c : leftPath)
-      debug->interpolatedPath[0].push_back(c.point);
-    for (const auto &c : rightPath)
-      debug->interpolatedPath[1].push_back(c.point);
-    debug->pathComplete = true;
-    publishPathStep(debug, "S10 内部短缺口插补", leftPath, rightPath);
-  }
+  path=std::move(complete);
 }
 
 std::vector<Candidate> regularizePath(const std::vector<Candidate> &path,
@@ -5490,6 +5311,18 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
     workingConfig.outlierMeanK = 0;
   }
   CloudT::ConstPtr workingInput = sourceInput;
+  // Surface fitting needs measured density, independently of detection sampling.
+  CloudT::ConstPtr surfaceInput = sourceInput;
+  std::vector<ScanFrameRange> surfaceFrames = frameBased
+      ? (config.extractMainBody ? bodyFrames : *detectionFrames) : std::vector<ScanFrameRange>{};
+  if (!frameBased && config.inputVoxelSize>0) {
+    if (config.extractMainBody) {
+      const auto detail=recoverMeasuredFrameSupport(input,{{0,input->size(),0}},
+          sourceInput,{{0,sourceInput->size(),0}},config.inputVoxelSize);
+      if (!detail.error.empty()) {result.summary=detail.error;return result;}
+      surfaceInput=detail.cloud;
+    } else surfaceInput=input;
+  }
   finishStage("main_body");
   std::vector<FrameProjection> frameProjections;
   std::vector<ScanFrameRange> processedFrames;
@@ -5498,7 +5331,7 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
     // Sampling is suitable for body masking and output density, but not for
     // deciding whether a tiny wall foot has become a different physical feature.
     // Recover full measured detail only in accepted body cells; rejected cells
-    // and missing frames remain excluded. Surface outputs still use sourceInput.
+    // and missing frames remain excluded. Reuse this detail for surface fitting.
     InputSamplingResult detail;
     CloudT::ConstPtr sectionInput=sourceInput;
     const auto *sectionFrames=config.extractMainBody ? &bodyFrames : detectionFrames;
@@ -5511,6 +5344,7 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
         sectionInput=input;sectionFrames=frames;
       }
     }
+    surfaceInput=sectionInput;surfaceFrames=*sectionFrames;
     CloudT::Ptr flattened;
     float frameStep = 1.0f;
     if (!prepareFrameSections(sectionInput, *sectionFrames,
@@ -5556,45 +5390,24 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
                                          rightHistory, debug)
                     : collectSlices(*workingInput, range, workingConfig,
                                     leftHistory, rightHistory, debug);
-  const auto outputSliceCount =
-      retainMainSegment(slices, workingConfig, leftHistory && rightHistory,
-                        debug);
   finishStage("candidates");
-  if (slices.size() < 3) {
-    result.summary = "Fewer than three usable cross-sections were found.";
-    return result;
+  std::array<std::vector<Slice>,2> sideSlices{{slices,slices}};
+  std::array<std::vector<Candidate>,2> paths;
+  std::array<std::vector<int>,2> outputFrameIds;
+  for(int side=0;side<2;++side) {
+    retainMainSegment(sideSlices[side],workingConfig,false,debug,side);
+    if(sideSlices[side].size()<3) {sideSlices[side].clear();continue;}
+    if(!optimizeSidePath(sideSlices[side],workingConfig,debug,side,paths[side],result.summary))return result;
+    if(debug)for(const auto &c:paths[side])debug->selectedPath[side].push_back(c.point);
+    interpolateSideGaps(*workingInput,range,sideSlices[side],workingConfig,paths[side],
+        frameBased?&processedFrames:nullptr,outputFrameIds[side]);
+    bridgeTrackedWalls(paths[side],workingConfig);
+    if(debug)for(const auto &c:paths[side])debug->interpolatedPath[side].push_back(c.point);
   }
-
-  // S09 成对优化左右轨迹，随后移除只参与优化的历史前视站位。
-  std::vector<Candidate> leftPath, rightPath;
-  if (!optimizePairedPaths(slices, workingConfig, debug, leftPath, rightPath,
-                           result.summary))
-    return result;
-  // 前视站位已经完成了对末端路径的约束，现在立即裁掉，保证保存和显示中
-  // 不会出现任何超出当前可靠几何范围的历史外推点。
-  if (outputSliceCount > 0 && outputSliceCount < slices.size()) {
-    slices.resize(outputSliceCount);
-    leftPath.resize(outputSliceCount);
-    rightPath.resize(outputSliceCount);
-  }
-
-  if (debug) {
-    for (const auto &c : leftPath)
-      debug->selectedPath[0].push_back(c.point);
-    for (const auto &c : rightPath)
-      debug->selectedPath[1].push_back(c.point);
-  }
-
-  publishPathStep(debug, "S09 成对路径优化", leftPath, rightPath);
-
-  // S10 插补内部短缺口；S11-S16 平滑、贴壁及局部底面求交。
-  std::vector<int> outputFrameIds;
-  interpolateInternalGaps(*workingInput, range, slices, workingConfig, leftPath,
-                          rightPath, debug,
-                          frameBased ? &processedFrames : nullptr,
-                          frameBased ? &outputFrameIds : nullptr);
-  bridgeTrackedWalls(leftPath,workingConfig);
-  bridgeTrackedWalls(rightPath,workingConfig);
+  auto &leftPath=paths[0];auto &rightPath=paths[1];
+  if(leftPath.empty() && rightPath.empty()) {result.summary="Fewer than three usable sections on either side.";return result;}
+  if(debug)debug->pathComplete=true;
+  publishPathStep(debug,"S09/S10 左右独立路径与内部插补",leftPath,rightPath);
   finishStage("path_and_interpolation");
   fillSideResult(leftPath, 0, workingInput, workingConfig, debug,
                   result.leftSeam,
@@ -5635,12 +5448,6 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
       restoreCandidate(side, i);
     }
   }
-  const int widthAxis = transverseAxes(config.longitudinalAxis)[0];
-  for (std::size_t i = 0; i < result.leftSeam->size(); ++i)
-    if ((*result.rightSeam)[i].data[widthAxis] - (*result.leftSeam)[i].data[widthAxis] < workingConfig.minSeamSeparation) {
-      restoreCandidate(0, i);
-      restoreCandidate(1, i);
-    }
   if (result.leftSmoothing.applied || result.rightSmoothing.applied) {
     result.leftConfidence =
         result.leftPointConfidence.empty()
@@ -5663,53 +5470,164 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
     publishDebugStep(debug, "S16b 最终轨迹连续平滑",
                      {{"左焊缝", result.leftSeam}, {"右焊缝", result.rightSeam}});
   finishStage("final_curve");
-  std::vector<float> endpointStations;
+  std::vector<float> endpointStations, rightEndpointStations;
   for (const auto &p:*result.leftSeam) endpointStations.push_back(coordinate(p,config.longitudinalAxis));
+  for (const auto &p:*result.rightSeam) rightEndpointStations.push_back(coordinate(p,config.longitudinalAxis));
   const auto widthDecision=classifySeamWidth(result,workingConfig);
   if (frameBased) {
     restoreOriginalFrameGeometry(result, outputFrameIds, frameProjections,
                                  config.longitudinalAxis);
     result.filteredCloud.reset(new CloudT(*sourceInput));
   }
-  // Emerging candidates remain eligible for output, but small consecutive
-  // steps cannot prove that their trajectory follows the correct feature.
-  // Apply the same sustained angle/deviation checks as for established walls;
-  // the trimmer already preserves short tracks, gentle bends and local bumps.
-  trimSeamEndpoints(result,workingConfig,&endpointStations,&widthDecision);
-  const auto keptBegin=result.endpointTrimmedStart;
-  const auto keptEnd=leftPath.size()-result.endpointTrimmedEnd;
-  if (keptBegin || result.endpointTrimmedEnd) {
-    leftPath=std::vector<Candidate>(leftPath.begin()+keptBegin,leftPath.begin()+keptEnd);
-    rightPath=std::vector<Candidate>(rightPath.begin()+keptBegin,rightPath.begin()+keptEnd);
-    publishDebugStep(debug,"S16c 首尾异常截断",{{"左焊缝",result.leftSeam},{"右焊缝",result.rightSeam}},
-        "首端移除 "+std::to_string(keptBegin)+" 帧/站位，尾端移除 "+std::to_string(result.endpointTrimmedEnd)+
-        (widthDecision.mode==1 ? "。依据单道中线截断，两侧范围同步。" : "。依据双道边界截断，两侧同步停止。"));
+  // Capture measured surface sections before trajectory-only endpoint cuts.
+  // A longitudinal bend can invalidate a motion track without invalidating
+  // the locally supported wall/floor. Surface classification below still
+  // requires measured support in each original section; it does not extrapolate.
+  // Join by detector station, never by vector index, for unequal side tracks.
+  std::map<float,SurfaceSection> joined;
+  const int across=transverseAxes(config.longitudinalAxis)[0];
+  for(int side=0;side<2;++side) {
+    const auto &cloud=side?*result.rightSeam:*result.leftSeam;
+    const auto &quality=side?result.rightPointQuality:result.leftPointQuality;
+    const auto &ids=side?result.rightFrameIndices:result.leftFrameIndices;
+    for(std::size_t i=0;i<paths[side].size();++i) {
+      const auto &candidate=paths[side][i];
+      const float station=coordinate(candidate.point,config.longitudinalAxis);
+      auto inserted=joined.emplace(station,SurfaceSection{});
+      auto &section=inserted.first->second;
+      if(inserted.second) {section.leftValid=section.rightValid=false;section.station=station;}
+      if(frameBased)section.frameIndex=ids[i];
+      auto normal=candidate.trackedWall?candidate.trackedNormal:candidate.hasWall?candidate.wallNormal:quality[i].wallAccepted?quality[i].wallNormal:Eigen::Vector2f::Zero().eval();
+      if(side) {section.right=cloud[i];section.rightNormal=normal;section.rightValid=true;}
+      else {section.left=cloud[i];section.leftNormal=normal;section.leftValid=true;}
+    }
   }
+  // A candidate can leave the real wall foot for an interior floor ripple.
+  // Before accepting that apparent endpoint, seek a connected measured wall
+  // and floor contact. A genuine geometric hook must still survive this check
+  // and be trimmed; merely increasing the endpoint thresholds is not enough.
+  SeamResult endpointProbe=result;
+  trimSeamEndpoints(endpointProbe,workingConfig,&endpointStations,&widthDecision,&rightEndpointStations);
+  std::array<std::size_t,2> recoveredFootCounts{{0,0}}, unsupportedTail{{0,0}};
+  bool needsRecovery=false;
+  for(int side=0;side<2;++side)if(endpointProbe.sideEndpointTrimmedEnd[side]) {
+    needsRecovery=true;
+    const auto &stations=side?rightEndpointStations:endpointStations;
+    const auto end=stations.size()-endpointProbe.sideEndpointTrimmedEnd[side];
+    const float begin=stations[end]-workingConfig.endpointTrimWindow;
+    for(auto &entry:joined)if(entry.first>=begin)
+      (side?entry.second.rightBoundaryUncertain:entry.second.leftBoundaryUncertain)=true;
+  }
+  if(needsRecovery) {
+    std::vector<SurfaceSection> recoverySections;
+    for(auto &entry:joined) {
+      auto section=entry.second;
+      if(!section.leftValid) {section.left=section.right;section.left.data[across]-=std::max(2.f,config.minSeamSeparation);}
+      if(!section.rightValid) {section.right=section.left;section.right.data[across]+=std::max(2.f,config.minSeamSeparation);}
+      recoverySections.push_back(section);
+    }
+    SeamResult measured;
+    std::vector<std::array<SurfaceEnd,2>> toes;
+    extractSurfaceClouds(sourceInput,recoverySections,workingConfig,measured,
+        frameBased ? (config.extractMainBody ? &bodyFrames : detectionFrames) : nullptr,false,nullptr,&toes);
+    std::map<float,std::size_t> byStation;
+    for(std::size_t i=0;i<recoverySections.size();++i)byStation.emplace(recoverySections[i].station,i);
+    if(debug)for(const auto &pair:toes)for(int side=0;side<2;++side)if(pair[side].valid) {
+      auto p=pair[side].point;p.data[int(config.longitudinalAxis)]=pair[side].station;
+      debug->measuredWallFeet[side].push_back(p);
+    }
+    for(auto &entry:joined)entry.second.leftBoundaryUncertain=entry.second.rightBoundaryUncertain=false;
+    for(int side=0;side<2;++side) {
+      if(!endpointProbe.sideEndpointTrimmedEnd[side])continue;
+      auto &cloud=side?result.rightSeam:result.leftSeam;
+      auto &stations=side?rightEndpointStations:endpointStations;
+      const auto count=cloud->size(), oldEnd=count-endpointProbe.sideEndpointTrimmedEnd[side];
+      std::vector<SurfaceEnd> feet;
+      for(auto station:stations)feet.push_back(toes[byStation.at(station)][side]);
+      const auto recovery=selectMeasuredFootContinuation(*cloud,stations,feet,oldEnd,workingConfig);
+      if(recovery.recovered.empty())continue;
+      const auto &kept=recovery.kept;
+      auto &quality=side?result.rightPointQuality:result.leftPointQuality;
+      for(auto i:recovery.recovered) {
+        const auto &toe=toes[byStation.at(stations[i])][side];
+        auto &q=quality[i];
+        q.geometryCorrection=(toVector(toe.point)-toVector((*cloud)[i])).norm();
+        q.supportDistance=0;q.trackedWall=q.wallAccepted=q.floorAccepted=false;
+        q.finalCurveCorrection=0;
+        q.flags&=~(QualityInterpolated|QualityFinalCurveSmoothed);
+        q.flags|=QualityMeasuredWallFoot;
+        (*cloud)[i]=toe.point;
+        paths[side][i].point=toe.point;
+        paths[side][i].point.data[int(config.longitudinalAxis)]=stations[i];
+        auto &section=joined.at(stations[i]);
+        (side?section.right:section.left)=toe.point;
+        (side?section.rightBoundaryUncertain:section.leftBoundaryUncertain)=true;
+        ++recoveredFootCounts[side];
+      }
+      // Stop at missing/disconnected evidence instead of retaining the rejected
+      // interior candidate or inventing a continuation through the gap.
+      unsupportedTail[side]=count-kept.back()-1;
+      CloudT::Ptr retained(new CloudT);
+      for(auto i:kept)retained->push_back((*cloud)[i]);
+      cloud=retained;
+      auto select=[&](auto &values) {
+        if(values.empty())return;
+        auto selected=values;selected.clear();
+        for(auto i:kept)selected.push_back(values[i]);
+        values=std::move(selected);
+      };
+      auto &confidence=side?result.rightPointConfidence:result.leftPointConfidence;
+      auto &ids=side?result.rightFrameIndices:result.leftFrameIndices;
+      auto &starts=side?result.rightSegmentStarts:result.leftSegmentStarts;
+      std::vector<std::size_t> newStarts;
+      for(auto start:starts) {
+        const auto position=std::lower_bound(kept.begin(),kept.end(),start);
+        if(position!=kept.end())newStarts.push_back(position-kept.begin());
+      }
+      starts=std::move(newStarts);
+      select(stations);select(quality);select(confidence);select(ids);select(paths[side]);
+      if(!confidence.empty())(side?result.rightConfidence:result.leftConfidence)=
+          std::accumulate(confidence.begin(),confidence.end(),0.f)/confidence.size();
+    }
+  }
+  // Re-evaluate the end on the recovered physical foot, independently per side.
+  trimSeamEndpoints(result,workingConfig,&endpointStations,&widthDecision,&rightEndpointStations);
+  for(int side=0;side<2;++side) {
+    const auto begin=result.sideEndpointTrimmedStart[side],end=paths[side].size()-result.sideEndpointTrimmedEnd[side];
+    for(std::size_t i=0;i<paths[side].size();++i)if(i<begin || i>=end) {
+      auto &section=joined.at(coordinate(paths[side][i].point,config.longitudinalAxis));
+      (side?section.rightBoundaryUncertain:section.leftBoundaryUncertain)=true;
+    }
+    paths[side]=std::vector<Candidate>(paths[side].begin()+begin,paths[side].begin()+end);
+  }
+  for(int side=0;side<2;++side)result.sideEndpointTrimmedEnd[side]+=unsupportedTail[side];
+  result.endpointTrimmedEnd=result.sideEndpointTrimmedEnd[0];
   finishStage("endpoint_trim");
-  // Preserve physical side/floor boundaries before output tracks are moved
-  // by constant-width processing or replaced by a single center trajectory.
   std::vector<SurfaceSection> surfaceSections;
-  for (std::size_t i=0; i<leftPath.size(); ++i) {
-    SurfaceSection section;
-    section.station=coordinate(leftPath[i].point,config.longitudinalAxis);
-    section.left=(*result.leftSeam)[i];
-    section.right=(*result.rightSeam)[i];
-    if(frameBased) section.frameIndex=result.leftFrameIndices[i];
-    auto normal=[](const Candidate &candidate, const SeamPointQuality &quality) {
-      if(candidate.trackedWall) return candidate.trackedNormal;
-      if(candidate.hasWall) return candidate.wallNormal;
-      if(quality.wallAccepted) return quality.wallNormal;
-      return Eigen::Vector2f(Eigen::Vector2f::Zero());
-    };
-    section.leftNormal=normal(leftPath[i],result.leftPointQuality[i]);
-    section.rightNormal=normal(rightPath[i],result.rightPointQuality[i]);
+  for(auto &entry:joined) {
+    auto &section=entry.second;
+    // A missing boundary is only a classification separator, never an output
+    // point or a fitted floor constraint. A single-side floor is bounded by
+    // connected measurements inward from the valid toe, not this separator.
+    if(!section.leftValid) {section.left=section.right;section.left.data[across]-=std::max(2.f,config.minSeamSeparation);}
+    if(!section.rightValid) {section.right=section.left;section.right.data[across]+=std::max(2.f,config.minSeamSeparation);}
     surfaceSections.push_back(section);
   }
-  extractSurfaceClouds(sourceInput,surfaceSections,workingConfig,result,
-      frameBased ? (config.extractMainBody ? &bodyFrames : detectionFrames) : nullptr,
-      generateSurfaceModels);
+  std::array<SurfaceEnd,2> surfaceEnds;
+  for(int side=0;side<2;++side)if(!paths[side].empty()) {
+    surfaceEnds[side].valid=true;
+    surfaceEnds[side].station=coordinate(paths[side].back().point,config.longitudinalAxis);
+    surfaceEnds[side].point=(side?result.rightSeam:result.leftSeam)->back();
+  }
+  extractSurfaceClouds(surfaceInput,surfaceSections,workingConfig,result,
+      frameBased ? &surfaceFrames : nullptr,
+      generateSurfaceModels,&surfaceEnds);
   finishStage("surface_extraction");
-  if(config.uniformWidthEnabled) {
+  const bool alignedSides=leftPath.size()==rightPath.size() &&
+      std::equal(leftPath.begin(),leftPath.end(),rightPath.begin(),[&](const Candidate &l,const Candidate &r) {
+        return std::fabs(coordinate(l.point,config.longitudinalAxis)-coordinate(r.point,config.longitudinalAxis))<1.e-4f;
+      });
+  if(config.uniformWidthEnabled && alignedSides) {
     std::vector<UniformWidthSection> sections(leftPath.size());
     for(std::size_t i=0;i<leftPath.size();++i) {
       const float station=coordinate(leftPath[i].point,config.longitudinalAxis);
@@ -5737,6 +5655,9 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
   }
   // S17 汇总左右结果。
   summarizeDetection(result, leftPath, rightPath);
+  if(recoveredFootCounts[0] || recoveredFootCounts[1])result.summary+=" Measured wall-foot recovery L/R="+
+      std::to_string(recoveredFootCounts[0])+"/"+std::to_string(recoveredFootCounts[1])+" points before endpoint detection.";
+  if(!alignedSides && (config.uniformWidthEnabled || config.adaptiveSeamCount)) result.summary+=" Width conversion skipped: independent side station ranges differ.";
   if (result.leftFinalCurve.applied || result.rightFinalCurve.applied) {
     result.summary += " Final curve smoothing: length=" + std::to_string(config.finalSmoothingLength) +
         ", mean correction L/R=" + std::to_string(result.leftFinalCurve.meanCorrection) + "/" +
@@ -5761,8 +5682,9 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
                       std::to_string(result.inputFrameCount) +
                       " frames; the common detection pipeline was used without "
                       "spatial slicing.";
-  if (config.trimUnstableEndpoints) result.summary+=" Endpoint trim: head="+std::to_string(result.endpointTrimmedStart)+
-      ", tail="+std::to_string(result.endpointTrimmedEnd)+" stations removed.";
+  if (config.trimUnstableEndpoints) result.summary+=" Independent endpoint trim L/R: head="+
+      std::to_string(result.sideEndpointTrimmedStart[0])+"/"+std::to_string(result.sideEndpointTrimmedStart[1])+
+      ", tail="+std::to_string(result.sideEndpointTrimmedEnd[0])+"/"+std::to_string(result.sideEndpointTrimmedEnd[1])+" stations removed.";
   if(config.uniformWidthEnabled)
     result.summary+=" Uniform bottom width: target="+std::to_string(result.uniformWidthTarget)+
         (config.uniformWidthMetric==UniformWidthMetric::BottomArc ? " (arc)" : " (chord)")+
@@ -5772,7 +5694,7 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
     result.summary+=" Uniform-width final filter: length="+std::to_string(config.uniformWidthFilterLength)+
         ", mean correction="+std::to_string(result.uniformWidthFilterMeanCorrection)+
         ", max correction="+std::to_string(result.uniformWidthFilterMaxCorrection)+".";
-  if(!config.uniformWidthEnabled)applySeamWidthRule(result,config,&widthDecision);
+  if(!config.uniformWidthEnabled && alignedSides)applySeamWidthRule(result,config,&widthDecision);
   result.summary+=" Surface points L/R/weld="+std::to_string(result.leftSurface->size())+"/"+
       std::to_string(result.rightSurface->size())+"/"+std::to_string(result.weldSurface->size())+".";
   result.summary+=" B-spline patches L/weld/R="+std::to_string(result.leftSurfaceModel.patches.size())+"/"+

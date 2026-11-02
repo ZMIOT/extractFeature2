@@ -20,6 +20,7 @@ int main() {
   a.curveLineFallback.search.continuityWeight = 4.5f;
   a.historyWeight = 8.5f;
   a.inputVoxelSize = .1f;
+  a.limitSurfaceEndsToTracks = false;
   original.algorithms.set(weld::ProfileLocalizationMethod::CurvatureCandidates, a);
   std::string error;
   CHECK(weld::saveLibraryConfig(path, original, &error));
@@ -28,6 +29,7 @@ int main() {
   CHECK(b.minSeamSeparation == 7.25f && b.curvatureSearch.maximumPairs == 13);
   CHECK(b.curveLineFallback.search.continuityWeight == 4.5f && b.historyWeight == 8.5f);
   CHECK(b.inputVoxelSize == .1f);
+  CHECK(!b.limitSurfaceEndsToTracks);
   CHECK(loaded.algorithms.get(weld::ProfileLocalizationMethod::CurveLineIntersection).minSeamSeparation == 8);
   const auto second = prefix + "_second.json";
   CHECK(weld::saveLibraryConfig(second, loaded, &error));
@@ -57,6 +59,7 @@ int main() {
   CHECK(write("{\"schemaVersion\":1}"));
   CHECK(weld::loadLibraryConfig(path, loaded, &error)); CHECK(error.empty());
   CHECK(loaded.algorithms.get(loaded.activeAlgorithm).minSeamSeparation == 6);
+  CHECK(loaded.algorithms.get(loaded.activeAlgorithm).limitSurfaceEndsToTracks);
   // The shipped file must remain equivalent to the library's built-in defaults.
   weld::LibraryConfig shipped;
   CHECK(weld::loadLibraryConfig(SEAM_DEFAULT_CONFIG, shipped, &error));

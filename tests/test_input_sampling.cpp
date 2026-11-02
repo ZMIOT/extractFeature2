@@ -89,9 +89,17 @@ void commonPipeline(bool framed,bool mainBody) {
   require(actual.inputSamplingPoints==sampled.cloud->size() &&
           actual.inputSamplingRemovedPoints==input->size()-sampled.cloud->size(),"Sampling counts incorrect");
   if (!framed) require(same(*actual.leftSeam,*expected.leftSeam) && same(*actual.rightSeam,*expected.rightSeam) &&
-          same(*actual.leftSurface,*expected.leftSurface) && same(*actual.rightSurface,*expected.rightSurface) &&
-          same(*actual.weldSurface,*expected.weldSurface) && same(*actual.mainBodyCloud,*expected.mainBodyCloud),
-          "A downstream stage used the original cloud or applied another voxel pass");
+          same(*actual.mainBodyCloud,*expected.mainBodyCloud),
+          "Detection used the original cloud or applied another voxel pass");
+  require(actual.leftSurface->size()>expected.leftSurface->size() &&
+          actual.rightSurface->size()>expected.rightSurface->size() &&
+          actual.weldSurface->size()>expected.weldSurface->size(),
+          "Surface fitting did not recover dense measured input");
+  std::set<std::array<float,3>> measured;
+  for(const auto &p:*input) measured.insert({{p.x,p.y,p.z}});
+  for(const auto &surface:{actual.leftSurface,actual.weldSurface,actual.rightSurface})
+    for(const auto &p:*surface)
+      require(measured.count({{p.x,p.y,p.z}})>0,"Surface output contains a generated point");
   require(same(*actual.mainBodyCloud,*expected.mainBodyCloud),"Body output no longer uses sampled points");
   if (framed) {
     const auto reference=weld::SeamDetector().detect(input,config,nullptr,nullptr,nullptr,&frames);
@@ -104,11 +112,6 @@ void commonPipeline(bool framed,bool mainBody) {
         require((weld::toVector((*a)[i])-weld::toVector((*b)[i])).norm()<.1f,
                 "Framed trajectory lost full-resolution detail");
     }
-    std::set<std::array<float,3>> measured;
-    for(const auto &p:*sampled.cloud) measured.insert({{p.x,p.y,p.z}});
-    for(const auto &surface:{actual.leftSurface,actual.weldSurface,actual.rightSurface})
-      for(const auto &p:*surface)
-        require(measured.count({{p.x,p.y,p.z}})>0,"Surface output contains a generated or unsampled point");
   }
   require(actual.leftFrameIndices==expected.leftFrameIndices && actual.rightFrameIndices==expected.rightFrameIndices,
           "Sampling changed frame identity inside the pipeline");
@@ -118,6 +121,6 @@ int main() {
   try {
     samplingRules();
     for(bool framed:{false,true})for(bool mainBody:{false,true})commonPipeline(framed,mainBody);
-    std::cout<<"Input sampling: measured subsets, frame identity, bounded detail and sparse outputs passed\n";
+    std::cout<<"Input sampling: measured subsets, frame identity, bounded detail and dense surfaces passed\n";
   } catch(const std::exception& e) {std::cerr<<e.what()<<'\n';return 1;}
 }

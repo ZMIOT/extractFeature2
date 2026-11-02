@@ -125,6 +125,7 @@ QJsonObject configJson(const DetectorConfig &c) {
   PARAM(curvatureWeight);
   PARAM(curveRegularizationWeight);
   PARAM(trimUnstableEndpoints);
+  PARAM(limitSurfaceEndsToTracks);
   PARAM(minimumFeatureDepth);
   PARAM(endpointTrimAngleDegrees);
   PARAM(endpointTrimWindow);
@@ -250,6 +251,8 @@ bool saveResults(const QString &outputPath, const SeamResult &r,
   metadata["removedBodyPoints"] = int(r.removedBodyPoints);
   metadata["endpointTrimmedStart"] = int(r.endpointTrimmedStart);
   metadata["endpointTrimmedEnd"] = int(r.endpointTrimmedEnd);
+  metadata["sideEndpointTrimmedStart"] = QJsonArray{int(r.sideEndpointTrimmedStart[0]),int(r.sideEndpointTrimmedStart[1])};
+  metadata["sideEndpointTrimmedEnd"] = QJsonArray{int(r.sideEndpointTrimmedEnd[0]),int(r.sideEndpointTrimmedEnd[1])};
   metadata["candidateCorrectionRejected"] = int(r.candidateCorrectionRejected);
   metadata["rightPoints"] = int(r.rightSeam->size());
   metadata["inputSamplingPoints"] = double(r.inputSamplingPoints);

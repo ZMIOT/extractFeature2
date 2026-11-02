@@ -18,13 +18,13 @@ struct SeamWidthDecision {
 // Decide once from the complete supported trajectory, before endpoint cuts.
 SeamWidthDecision classifySeamWidth(const SeamResult &result, const DetectorConfig &config);
 
-// Trim the center in single mode, or either boundary in double mode.
-// Both observed boundaries retain the same range for later output generation.
+// Trim each observed side independently, preserving its own metadata and range.
 // Use monotonic scan stations as the
 // parameter (world X may turn back). Without stations, use the configured axis.
 void trimSeamEndpoints(SeamResult &result, const DetectorConfig &config,
                        const std::vector<float> *stations = nullptr,
-                       const SeamWidthDecision *decision = nullptr);
+                       const SeamWidthDecision *decision = nullptr,
+                       const std::vector<float> *rightStations = nullptr);
 // Choose one mode for the complete fitted trajectory by station-width majority.
 // Equal votes select the center track; preserve existing physical segment gaps.
 void applySeamWidthRule(SeamResult &result, const DetectorConfig &config,
