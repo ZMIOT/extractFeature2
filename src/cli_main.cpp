@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
   if (args.contains("--help") || args.size() == 1) {
     out << "Scheme 1 weld seam extraction\nUsage: weld_seam_cli --input "
            "cloud.txt --output results/seams.pcd\n"
-        << "  --axis x|y|z  --slice-step 2  --slice-thickness 3.5\n"
+        << "  --axis auto|x|y|z  --slice-step 2  --slice-thickness 3.5\n"
         << "  --config path.json  Local SDK config (default: bin/config/weld_seam.json)\n"
         << "  Explicit CLI options override the selected algorithm's file settings.\n"
         << "  --profile-merge-frames 5  --no-profile-frame-merge (original frames only)\n"
@@ -73,7 +73,7 @@ int main(int argc, char **argv) {
         << "  --profile-wall-tolerance 0.6  Maximum local candidate distance to wall\n"
         << "  --double-seam-width 13  Whole-seam majority vote (ties: single)\n"
         << "  --width-rule  Enable whole-seam width vote (default: always two tracks)\n"
-        << "  --opening positive-v|negative-v|either --candidate-max-correction 1\n"
+        << "  --opening auto|positive-v|negative-v|either --candidate-max-correction 1\n"
         << "  --postprocess legacy|robust-rts  --rts-process-noise 0.04\n"
         << "  --rts-measurement-stddev 0.6  --rts-gate 9.21\n"
         << "  --rts-max-correction 2  --rts-geometry-tolerance 0.6\n"
@@ -210,6 +210,8 @@ int main(int argc, char **argv) {
       continue;
     if (key == "--opening") {
       const QString value = i + 1 < args.size() ? args[++i].toLower() : QString();
+      if (value == "auto") { config.autoOpeningDirection=true; continue; }
+      config.autoOpeningDirection=false;
       if (value == "positive-v") config.interiorOpeningDirection = 1;
       else if (value == "negative-v") config.interiorOpeningDirection = -1;
       else if (value == "either") config.interiorOpeningDirection = 0;
@@ -310,12 +312,14 @@ int main(int argc, char **argv) {
     else if (key == "--output")
       output = value;
     else if (key == "--axis") {
+      if (value.toLower() == "auto") { config.autoLongitudinalAxis=true; continue; }
       const int axis = QStringList{"x", "y", "z"}.indexOf(value.toLower());
       if (axis < 0) {
-        err << "Axis must be x, y or z.\n";
+        err << "Axis must be auto, x, y or z.\n";
         return 2;
       }
       config.longitudinalAxis = weld::Axis(axis);
+      config.autoLongitudinalAxis = false;
     } else {
       bool ok = false;
       const float number = value.toFloat(&ok);
@@ -364,6 +368,7 @@ int main(int argc, char **argv) {
     // 与界面共用入口；仅 debugFlag 开启时同步展示 VTK 步骤窗口。
     const auto result =
         weld::detectWithDebugViewer(cloud, config, nullptr, frames);
+    out << QString::fromStdString(result.directionSummary) << '\n';
     out << QString::fromStdString(result.summary)
         << "\nElapsed ms: " << timer.elapsed() << '\n';
     for (const auto &stage : result.stageMilliseconds)

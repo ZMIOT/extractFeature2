@@ -56,10 +56,13 @@ int main(int argc, char **argv) {
     auto *doubleWidth = window.findChild<QDoubleSpinBox *>("doubleSeamWidth");
     auto *debugStart = window.findChild<QSpinBox *>("debugStartSlice");
     auto *debugPosition = window.findChild<QLabel *>("debugSlicePosition");
+    auto *autoAxis = window.findChild<QCheckBox *>("autoLongitudinalAxis");
+    auto *autoOpening = window.findChild<QCheckBox *>("autoOpeningDirection");
     const bool defaultsOk = advanced && surface && floor && floorSize && floorGuard &&
         maxCorrection && floorRms && turn && localization && spline && trim &&
         radius && beadHeight && beadWidth && regionLength && regionFraction && wallTolerance && widthRule && doubleWidth &&
         debugStart && debugPosition && surfaceModels && surfaceModels->isChecked() &&
+        autoAxis && autoOpening && autoAxis->isChecked() && autoOpening->isChecked() &&
         !surface->isChecked() && !widthRule->isChecked() &&
         turn->count() == 5 && turn->currentIndex() == 4 &&
         localization->count() == 2 && localization->currentIndex() == 1 &&

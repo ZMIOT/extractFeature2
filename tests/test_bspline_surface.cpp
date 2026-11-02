@@ -149,6 +149,75 @@ void denseFrameHoleTest() {
             "Physical-neighborhood repair changed surface shape");
   }
 }
+void wallFootGapTest(weld::Axis axis,int opening,bool framed,bool curved=false) {
+  weld::CloudT cloud;std::vector<weld::SurfaceSection> sections;
+  std::vector<std::vector<std::size_t>> groups;std::vector<unsigned char> labels;
+  weld::DetectorConfig config;config.longitudinalAxis=axis;config.sliceStep=1;
+  config.interiorOpeningDirection=opening;
+  const int a=int(axis),b=a==0?1:0,c=a==2?1:2;
+  auto point=[&](float station,float h) {
+    weld::PointT p;p.data[b]=8+(curved?.2f*h*h:.5f*h);p.data[c]=opening*h;
+    p.data[a]=framed?-station+.15f*p.data[b]:station;return p;
+  };
+  for(int r=0;r<40;++r) {
+    weld::SurfaceSection s;s.station=float(r);s.frameIndex=framed?r:-1;
+    s.right=point(float(r),0);s.rightNormal=Eigen::Vector2f(1,curved?0:-.5f*opening).normalized();
+    sections.push_back(s);groups.emplace_back();
+    const int begin=r>=12 && r<=18?30:2;
+    for(int j=begin;j<=100;++j) {
+      groups.back().push_back(cloud.size());labels.push_back(2);cloud.push_back(point(float(r),.1f*j));
+    }
+  }
+  const auto model=weld::fitSurfaceModel(cloud,groups,sections,labels,2,config);
+  require(model.patches.size()==1 && model.rejectedPatchCount==0,"Supported wall-foot notch did not close continuously");
+  const auto &patch=model.patches.front();
+  require(patch.sampleCount==cloud.size(),"Inferred wall strip counted as measured points");
+  for(int i=0;i<=100;++i) {
+    Eigen::Vector3d p,q,n;
+    require(patch.evaluate(i/100.,0,p,&n) && patch.evaluate(i/100.,1,q),"Repaired wall has a singular surface");
+    const auto &foot=std::abs(p[c])<std::abs(q[c])?p:q;
+    require(std::abs(foot[c])<.2 && std::abs(foot[b]-8)<.2,"Wall repair left a gap at the supported foot");
+    for(int j=0;j<=20;++j) {
+      require(patch.evaluate(i/100.,j/20.,p),"Repaired wall cannot be evaluated");
+      require(opening*p[c]>=-.2 && opening*p[c]<=10.2,"Repaired wall extends past its foot or outer rim");
+      const double expected=curved?.2*p[c]*p[c]:.5*opening*p[c];
+      require(std::abs(p[b]-8-expected)<(curved?.65:.05),"Gap fill left the neighboring wall surface");
+    }
+  }
+  // A remote boundary is not a license to bridge a large unsupported strip.
+  for(auto &s:sections)s.right=point(s.station,-30);
+  const auto remote=weld::fitSurfaceModel(cloud,groups,sections,labels,2,config);
+  require(remote.valid(),"Rejected remote foot discarded the measured wall");
+  for(const auto &p:remote.patches)for(double u:{0.,.5,1.})for(double v:{0.,1.}) {
+    Eigen::Vector3d q;require(p.evaluate(u,v,q) && opening*q[c]>-1,"Wall repair bridged a remote boundary");
+  }
+}
+
+void shortSupportedStripTest() {
+  weld::CloudT cloud;std::vector<weld::SurfaceSection> sections;
+  std::vector<std::vector<std::size_t>> groups;std::vector<unsigned char> labels;
+  weld::DetectorConfig config;config.sliceStep=2;
+  config.profileWallTolerance=config.hullSurfaceDistance=.05f;
+  for(int r=0;r<5;++r) {
+    weld::SurfaceSection s;s.station=2.f*r;sections.push_back(s);groups.emplace_back();
+    const float width=r==2?13.f:10.f;
+    for(int j=0;j<=100;++j) {
+      groups.back().push_back(cloud.size());labels.push_back(1);
+      cloud.push_back({s.station,width*j/100.f,0});
+    }
+  }
+  const auto model=weld::fitSurfaceModel(cloud,groups,sections,labels,1,config);
+  require(model.patches.size()==1 && model.rejectedPatchCount==0,
+          "Five supported sections were discarded because the coarse cubic basis underfit a local boundary");
+  const auto &patch=model.patches.front();
+  require(patch.countU==5 && patch.rmsError<=.1 && patch.sampleCount==cloud.size(),
+          "Short-patch retry relaxed quality or invented measured samples");
+  require(patch.firstStation==0 && patch.lastStation==8,"Short-patch retry lost supported coverage");
+  for(double u:{0.,.25,.5,.75,1.})for(double v:{0.,.5,1.}) {
+    Eigen::Vector3d p,n;
+    require(patch.evaluate(u,v,p,&n) && std::abs(p.z())<1.e-7,"Short strip retry left the measured plane");
+  }
+}
 }
 int main() {
   try {
@@ -158,6 +227,10 @@ int main() {
     noisyBoundaryTest();
     for(bool framed:{false,true})for(bool vertical:{false,true})holesTest(framed,vertical);
     denseFrameHoleTest();
+    shortSupportedStripTest();
+    for(auto axis:{weld::Axis::X,weld::Axis::Y,weld::Axis::Z})
+      for(int opening:{-1,1})for(bool framed:{false,true})wallFootGapTest(axis,opening,framed);
+    wallFootGapTest(weld::Axis::X,1,true,true);
     std::cout<<"B-spline analytic geometry, normals, gaps, reversed tilted scans, vertical walls and invalid input passed.\n";
     return 0;
   }catch(const std::exception &e){std::cerr<<e.what()<<'\n';return 1;}

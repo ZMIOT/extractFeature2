@@ -82,6 +82,18 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 }
 void MainWindow::finishDetection(const DetectionRun &run) {
   result_ = run.result;
+  if (!result_.directionSummary.empty()) {
+    const QSignalBlocker axisBlock(axis_), openingBlock(opening_);
+    axis_->setCurrentIndex(int(result_.resolvedLongitudinalAxis));
+    opening_->setCurrentIndex(result_.resolvedOpeningDirection>0 ? 0 : result_.resolvedOpeningDirection<0 ? 1 : 2);
+    resultConfig_.longitudinalAxis=result_.resolvedLongitudinalAxis;
+    resultConfig_.interiorOpeningDirection=result_.resolvedOpeningDirection;
+    const auto directionText=QString::fromStdString(result_.directionSummary)+
+        QStringLiteral("\nPCA：(%1, %2, %3)").arg(result_.principalDirection.x(),0,'f',4)
+            .arg(result_.principalDirection.y(),0,'f',4).arg(result_.principalDirection.z(),0,'f',4);
+    directionLabel_->setText(directionText);
+    appendLog(directionText);
+  }
   surfaceMeshes_[0]=surfaceMesh(result_.leftSurfaceModel);
   surfaceMeshes_[1]=surfaceMesh(result_.rightSurfaceModel);
   surfaceMeshes_[2]=surfaceMesh(result_.weldSurfaceModel);
@@ -214,13 +226,26 @@ void MainWindow::buildUi() {
       spin(0, 20, .5,
            QStringLiteral("底面和侧壁联合交点相对贴壁结果的最大允许位移。"));
   maxCorrection_->setObjectName("floorPatchMaxCorrection");
-  form->addRow(QStringLiteral("焊缝延伸轴"), axis_);
+  autoAxis_ = new QCheckBox(QStringLiteral("主体 PCA 自动判断延伸轴"), parameters_);
+  autoAxis_->setObjectName("autoLongitudinalAxis");
+  autoAxis_->setToolTip(QStringLiteral("主体提取后按 PCA 主方向选择最接近的 X/Y/Z 轴。主方向不明确时使用下方备用轴；不旋转原始坐标。"));
+  form->addRow(autoAxis_);
+  form->addRow(QStringLiteral("延伸轴 / 备用轴"), axis_);
   opening_ = new QComboBox(parameters_);
   opening_->setObjectName("interiorOpeningDirection");
   opening_->addItems({QStringLiteral("朝 +V（下凹槽）"), QStringLiteral("朝 -V（反向槽）"), QStringLiteral("不限方向（兼容）")});
   opening_->setToolTip(QStringLiteral("剖面纵轴 V：延伸轴为 X/Y 时是 Z，为 Z 时是 Y。下凹槽只接受底部两侧交界，避免选到反向结构。"));
   connect(opening_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) { invalidateResult(); });
-  form->addRow(QStringLiteral("槽口方向"), opening_);
+  autoOpening_ = new QCheckBox(QStringLiteral("按主体截面自动判断槽口方向"), parameters_);
+  autoOpening_->setObjectName("autoOpeningDirection");
+  autoOpening_->setToolTip(QStringLiteral("多个截面凹凸形状投票判断 +V/-V，证据不足时使用下方备用方向并在日志提示。"));
+  form->addRow(autoOpening_);
+  form->addRow(QStringLiteral("槽口方向 / 备用"), opening_);
+  directionLabel_ = new QLabel(parameters_);
+  directionLabel_->setWordWrap(true);
+  form->addRow(directionLabel_);
+  connect(autoAxis_, &QCheckBox::toggled, this, [this](bool) { invalidateResult(); updateDebugSliceRange(); });
+  connect(autoOpening_, &QCheckBox::toggled, this, [this](bool) { invalidateResult(); });
   form->addRow(QStringLiteral("截面步长"), step_);
   form->addRow(QStringLiteral("截面厚度"), thickness_);
   mergeProfileFrames_ = new QCheckBox(QStringLiteral("多帧投影合并拟合"), parameters_);
@@ -347,7 +372,7 @@ void MainWindow::buildUi() {
   trimEndpoints_->setToolTip(QStringLiteral("疑似尾段先检查实测侧壁脚，修正误跟踪到底面纹路的候选，再从稳定段检查方向变化和偏离量；连续异常达到确认长度时停止。左右分别判断。"));
   limitSurfaceEnds_ = new QCheckBox(QStringLiteral("面随左右轨迹各自终点停止"),parameters_);
   limitSurfaceEnds_->setObjectName("limitSurfaceEndsToTracks");
-  limitSurfaceEnds_->setToolTip(QStringLiteral("左右侧壁分别停在各自轨迹终点，底面沿两个终点之间的边界收口。取消后可提取轨迹终点之外仍有实测支持的面。"));
+  limitSurfaceEnds_->setToolTip(QStringLiteral("左右侧壁分别停在各自轨迹终点，底面限制在两侧壁共同覆盖的范围内。取消后可提取轨迹终点之外仍有实测支持的面。"));
   connect(limitSurfaceEnds_,&QCheckBox::toggled,this,[this] { invalidateResult(); });
   inputVoxel_ = spin(0, 1000000000, .001, QStringLiteral("直接输入降采样 size，支持最多六位小数，0 关闭。主体分析使用采样点，面提取恢复主体范围内的原始密集点。有原始帧时，轨迹也恢复原始轮廓，帧几何不随采样改变；无帧号时轨迹检测使用采样点。较大的 size 仍可能改变主体范围。"));
   inputVoxel_->setObjectName("inputVoxelSize");
@@ -677,6 +702,13 @@ void MainWindow::updateDebugSliceRange() {
   if (!frames_.empty()) {
     total = std::max(1, int(frames_.size()));
   } else if (cloud_ && !cloud_->empty()) {
+    if (autoAxis_->isChecked() && result_.directionSummary.empty()) {
+      const QSignalBlocker blocker(debugStart_);
+      debugStart_->setRange(1,100000);
+      debugStart_->setSuffix(QStringLiteral(" / 待自动判断"));
+      debugPositionLabel_->setText(QStringLiteral("主体方向确定后按空间截面序号定位"));
+      return;
+    }
     minimum = std::numeric_limits<float>::max();
     maximum = -std::numeric_limits<float>::max();
     const int axis = axis_->currentIndex();
@@ -787,6 +819,8 @@ void MainWindow::updateAlgorithmControls() {
 void MainWindow::applyConfig(const DetectorConfig &c) {
   settingDefaults_ = true;
   axis_->setCurrentIndex(int(c.longitudinalAxis));
+  autoAxis_->setChecked(c.autoLongitudinalAxis);
+  autoOpening_->setChecked(c.autoOpeningDirection);
   step_->setValue(c.sliceStep);
   thickness_->setValue(c.sliceThickness);
   mergeProfileFrames_->setChecked(c.mergeProfileFrames);
@@ -880,6 +914,8 @@ void MainWindow::applyConfig(const DetectorConfig &c) {
 DetectorConfig MainWindow::currentConfig() const {
   DetectorConfig c = algorithmParameters_.get(activeAlgorithm_);
   c.longitudinalAxis = Axis(axis_->currentIndex());
+  c.autoLongitudinalAxis = autoAxis_->isChecked();
+  c.autoOpeningDirection = autoOpening_->isChecked();
   c.sliceStep = float(step_->value());
   c.sliceThickness = float(thickness_->value());
   c.mergeProfileFrames = mergeProfileFrames_->isChecked();
@@ -957,6 +993,7 @@ void MainWindow::invalidateResult() {
   if (settingDefaults_ || busy_)
     return;
   result_ = SeamResult();
+  if (directionLabel_) directionLabel_->setText(QStringLiteral("主体提取后显示方向判断结果"));
   if (save_)
     save_->setEnabled(false);
   if (resultLabel_)
@@ -1002,6 +1039,7 @@ void MainWindow::runDetection() {
   resultConfig_ = currentConfig();
   resultGenerateSurfaceModels_ = generateSurfaceModels_->isChecked();
   result_ = SeamResult();
+  directionLabel_->setText(QStringLiteral("主体提取后显示方向判断结果"));
   busy_ = true;
   parameters_->setEnabled(false);
   generateSurfaceModels_->setEnabled(false);
@@ -1118,7 +1156,7 @@ void MainWindow::refreshView(bool reset) {
       selected->reserve(frame.count);
       for (std::size_t i = frame.begin; i < frame.begin + frame.count && i < cloud_->size(); ++i)
         selected->push_back((*cloud_)[i]);
-    } else {
+    } else if (!autoAxis_->isChecked() || !result_.directionSummary.empty()) {
       float minimum = std::numeric_limits<float>::max();
       const int axis = axis_->currentIndex();
       for (const auto &point : *cloud_)

@@ -623,6 +623,7 @@ void testShortWallFallback() {
           "Invalid active fallback settings were accepted");
   config.curveLineFallback.splineRadius=8;
   config.interiorOpeningDirection=-1;
+  config.autoOpeningDirection=false; // Explicit manual direction must still reject the opposite groove.
   require(!weld::SeamDetector().detect(cloud,config,nullptr,nullptr,nullptr,&frames).ok(),
           "Fallback accepted a groove with the wrong opening direction");
 }
@@ -2036,6 +2037,7 @@ int main(int argc, char **argv) {
       require(!quality.wallAccepted && !quality.floorAccepted,
               "Master switch left an active geometry constraint");
     trough.interiorOpeningDirection = -1;
+    trough.autoOpeningDirection = false; // This case explicitly tests manual rejection.
     require(!weld::SeamDetector().detect(narrow.cloud, trough, nullptr, nullptr, nullptr, &narrow.frames).ok(),
             "Wrong opening direction accepted the opposite trough");
     auto clippedInput = weld::CloudT::Ptr(new weld::CloudT(*profiles.cloud));

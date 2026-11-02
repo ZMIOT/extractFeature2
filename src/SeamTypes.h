@@ -156,6 +156,10 @@ struct DetectorConfig {
   float floorPatchMaxCorrection = 5.0f;
   /** @brief 纵向轴：0=X、1=Y、2=Z。 @details 默认 Axis::X；有效范围 0..2。 */
   Axis longitudinalAxis = Axis::X;
+  /** @brief 主体提取后用 PCA 自动选择最接近的 X/Y/Z 延伸轴；有原始帧时优先使用主体帧中心的推进主方向，不可靠时使用 longitudinalAxis。 */
+  bool autoLongitudinalAxis = true;
+  /** @brief 主体截面凹凸投票自动判断槽口朝向；不可靠时使用 interiorOpeningDirection。 */
+  bool autoOpeningDirection = true;
 
   // 所有长度参数都使用点云自身单位；当前样例数据按毫米设置默认值。
   /** @brief 预处理体素边长（长度）；0 禁用体素降采样。 @details 默认 0.8f；有效范围 0..1000000000。 */
@@ -481,6 +485,11 @@ struct SeamResult {
   std::array<std::size_t,2> sideEndpointTrimmedStart{{0,0}}, sideEndpointTrimmedEnd{{0,0}};
   /// @brief 主体提取后的实测点云。
   CloudT::Ptr mainBodyCloud{new CloudT};
+  Axis resolvedLongitudinalAxis = Axis::X; ///< 本次实际使用的延伸轴。
+  int resolvedOpeningDirection = 1; ///< 本次实际使用的槽口朝向。
+  Eigen::Vector3f principalDirection = Eigen::Vector3f::Zero(); ///< 主体 PCA 单位主向量，最大分量取正。
+  bool automaticAxisReliable = false, automaticOpeningReliable = false;
+  std::string directionSummary; ///< 自动方向结果及不可靠时的回退说明。
   /// @brief 左侧壁实测 XYZ 点云；原始坐标和输入顺序，不含拟合生成点。
   CloudT::Ptr leftSurface{new CloudT};
   /// @brief 右侧壁实测 XYZ 点云；与左侧壁、焊道面的输入点索引互斥。

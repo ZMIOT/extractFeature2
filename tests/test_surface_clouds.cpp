@@ -99,8 +99,7 @@ void geometryTest(weld::Axis axis, int opening, int wallShape, bool framed, bool
       std::set<Key> expected;
       for(const auto &p:*before) {
         const float station=framed?-(p.data[a]-.15f*p.data[u]):p.data[a];
-        const float fraction=std::max(0.f,std::min(1.f,(p.data[u]+8)/16));
-        const float stop=side==0?8:side==1?18:8+fraction*10;
+        const float stop=side==1?18:8;
         if(station<=stop+1.e-4f)expected.insert(key(p));
       }
       require(after->size()==expected.size(),"Independent surface endpoints lost valid coverage");
@@ -328,6 +327,52 @@ void singleWallFloorTest(weld::Axis axis,int opening,int side) {
   require(result.weldSurface->empty(),"Unsupported section generated a floor");
 }
 
+void boundedTwoWallFloorTest(weld::Axis axis,bool framed) {
+  weld::DetectorConfig config;config.longitudinalAxis=axis;config.sliceStep=2;
+  const int a=int(axis),u=a==0?1:0,v=a==2?1:2;
+  auto point=[&](float station,float width,float height) {
+    weld::PointT p;p.data[a]=framed?-station+.15f*width:station;
+    p.data[u]=width;p.data[v]=height;return p;
+  };
+  weld::CloudT::Ptr input(new weld::CloudT);
+  std::vector<weld::SurfaceSection> sections;
+  std::vector<weld::ScanFrameRange> frames;
+  for(int f=0;f<20;++f) {
+    const float station=2.f*f;const auto begin=input->size();
+    weld::SurfaceSection s;s.station=station;s.frameIndex=framed?100+f:-1;
+    s.left=point(station,-8,0);s.right=point(station,8,0);
+    s.leftValid=f>=3 && f<=17;s.rightValid=f<=14;
+    s.leftNormal=Eigen::Vector2f(1,.5f).normalized();
+    s.rightNormal=Eigen::Vector2f(1,-.5f).normalized();
+    // A transient lost left wall must not turn an exterior floor sheet into
+    // weld material just because the right wall remains visible (6.txt).
+    if(f==7)s.leftValid=false;
+    for(int j=(f==7?-220:-80);j<=80;++j)input->push_back(point(station,.1f*j,0));
+    for(int side:{0,1})if(side?s.rightValid:s.leftValid)
+      for(int j=1;j<=150;++j)input->push_back(point(station,(side?1:-1)*(8+.05f*j),.1f*j));
+    sections.push_back(s);frames.push_back({begin,input->size()-begin,100+f});
+  }
+  weld::SeamResult result;
+  weld::extractSurfaceClouds(input,sections,config,result,framed?&frames:nullptr);
+  checkMeasured(*input,result);
+  require(result.weldSurface->size()>1500,"Two-wall bound discarded supported interior floor");
+  for(const auto &p:*result.weldSurface) {
+    const float station=framed?-p.data[a]+.15f*p.data[u]:p.data[a];
+    require(station>=6-1.e-4f && station<=28+1.e-4f,"Floor protrudes past a measured wall start/end");
+    require(p.data[u]>-8 && p.data[u]<8,"Floor crossed a measured wall foot");
+  }
+  require(result.weldSurfaceModel.valid(),"Bounded floor model is missing");
+  for(const auto &patch:result.weldSurfaceModel.patches) {
+    require(patch.firstStation>=6 && patch.lastStation<=28,"Floor model extrapolated its measured support");
+    for(int i=0;i<=40;++i)for(int j=0;j<=20;++j) {
+      Eigen::Vector3d p,n;require(patch.evaluate(i/40.,j/20.,p,&n),"Bounded floor has a singular fit");
+      const double station=framed?-p[a]+.15*p[u]:p[a];
+      require(station>=6-1.e-3 && station<=28+1.e-3 && p[u]>=-8 && p[u]<=8,
+              "Fitted bottom protrudes beyond the two-wall corridor");
+    }
+  }
+}
+
 void measuredFootContinuationTest() {
   weld::DetectorConfig config;
   weld::CloudT candidate,physical;
@@ -533,6 +578,8 @@ int main(int argc,char **argv) {
       for(int opening : {-1,1}) for(int shape : {0,1,2}) for(bool framed : {false,true})
         geometryTest(axis,opening,shape,framed);
     detectorTest();
+    for(auto axis:{weld::Axis::X,weld::Axis::Y,weld::Axis::Z})
+      for(bool framed:{false,true})boundedTwoWallFloorTest(axis,framed);
     roughWeldTest();
     shallowTipTest();
     for(auto axis:{weld::Axis::X,weld::Axis::Y,weld::Axis::Z})

@@ -99,6 +99,8 @@ private:
   QCheckBox *debugFlag_ = nullptr;
   QComboBox *debugMode_ = nullptr;
   QComboBox *opening_ = nullptr;
+  QCheckBox *autoAxis_ = nullptr, *autoOpening_ = nullptr;
+  QLabel *directionLabel_ = nullptr;
   QDoubleSpinBox *candidateCorrection_ = nullptr;
   QSpinBox *debugBatch_ = nullptr, *debugStart_ = nullptr;
   QDoubleSpinBox *hullVoxel_ = nullptr, *hullDistance_ = nullptr,

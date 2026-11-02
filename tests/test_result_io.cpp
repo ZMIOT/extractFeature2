@@ -4,6 +4,7 @@
 #include <QFile>
 #include <QTemporaryDir>
 #include <QJsonDocument>
+#include <QJsonObject>
 #include <QJsonArray>
 #include <iostream>
 #include <stdexcept>
@@ -123,6 +124,16 @@ int main(int argc, char **argv) {
       require(!QFile::exists(dir.path()+"/test_"+name+"_left.pcd"),"Repeated save duplicated surface suffix");
     }
 
+    result.directionSummary="automatic test";
+    result.resolvedLongitudinalAxis=weld::Axis::Y;
+    result.resolvedOpeningDirection=-1;
+    result.automaticAxisReliable=result.automaticOpeningReliable=true;
+    require(weld::saveResults(dir.path()+"/automatic.pcd",result,config,&error),"Automatic direction export failed");
+    QFile directionFile(dir.path()+"/automatic_params.json");
+    require(directionFile.open(QIODevice::ReadOnly),"Automatic direction metadata missing");
+    const auto direction=QJsonDocument::fromJson(directionFile.readAll()).object();
+    require(direction["longitudinalAxis"].toInt()==1 && direction["interiorOpeningDirection"].toInt()==-1 &&
+            direction["automaticAxisReliable"].toBool(),"Export retained the original direction settings");
     *result.centerSeam=*result.leftSeam;
     result.centerFrameIndices=result.leftFrameIndices;
     result.centerPointConfidence=result.leftPointConfidence;

@@ -162,7 +162,12 @@ QJsonObject configJson(const DetectorConfig &c) {
   return j;
 }
 bool saveResults(const QString &outputPath, const SeamResult &r,
-                 const DetectorConfig &c, QString *error) {
+                 const DetectorConfig &config, QString *error) {
+  auto c=config;
+  if (!r.directionSummary.empty()) {
+    c.longitudinalAxis=r.resolvedLongitudinalAxis;
+    c.interiorOpeningDirection=r.resolvedOpeningDirection;
+  }
   if (outputPath.trimmed().isEmpty()) {
     if (error) *error = QStringLiteral("请选择保存路径。");
     return false;
@@ -223,6 +228,10 @@ bool saveResults(const QString &outputPath, const SeamResult &r,
     return false;
   }
   QJsonObject metadata = configJson(c);
+  metadata["directionSummary"]=QString::fromStdString(r.directionSummary);
+  metadata["principalDirection"]=QJsonArray{r.principalDirection.x(),r.principalDirection.y(),r.principalDirection.z()};
+  metadata["automaticAxisReliable"]=r.automaticAxisReliable;
+  metadata["automaticOpeningReliable"]=r.automaticOpeningReliable;
   const std::pair<QString,const BSplineSurfaceModel *> models[]={
     {"left",&r.leftSurfaceModel},{"weld",&r.weldSurfaceModel},{"right",&r.rightSurfaceModel}};
   QJsonObject modelFiles;

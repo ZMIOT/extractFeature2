@@ -67,8 +67,19 @@ struct Row {
   std::vector<double> arc;
   Eigen::Vector3d center=Eigen::Vector3d::Zero();
   double u=0,contourLength=0;
+  bool hasFoot=false,footAtStart=false;
+  Eigen::Vector3d foot=Eigen::Vector3d::Zero();
+  Eigen::Vector2d footNormal=Eigen::Vector2d::Zero();
 };
 Eigen::Vector3d interpolate(const Row &row,double t) {
+  if(row.hasFoot && row.footAtStart && t<row.arc.front()) {
+    const double w=t/row.arc.front();
+    return (1-w)*row.foot+w*row.points.front();
+  }
+  if(row.hasFoot && !row.footAtStart && t>row.arc.back()) {
+    const double w=(t-row.arc.back())/(1-row.arc.back());
+    return (1-w)*row.points.back()+w*row.foot;
+  }
   const auto it=std::lower_bound(row.arc.begin(),row.arc.end(),t);
   if(it==row.arc.begin())return row.points.front();
   if(it==row.arc.end())return row.points.back();
@@ -77,7 +88,7 @@ Eigen::Vector3d interpolate(const Row &row,double t) {
   return (1-weight)*row.points[j-1]+weight*row.points[j];
 }
 bool fitRun(std::vector<Row> &rows,const std::vector<SurfaceSection> &sections,
-            const DetectorConfig &config,BSplineSurfacePatch &out) {
+            const DetectorConfig &config,BSplineSurfacePatch &out,int minimumControlsU=4) {
   if(rows.size()<4)return false;
   // Projection chooses a consistent contour direction even for vertical walls.
   const int a=int(config.longitudinalAxis),b=a==0?1:0,c=a==2?1:2;
@@ -95,6 +106,25 @@ bool fitRun(std::vector<Row> &rows,const std::vector<SurfaceSection> &sections,
   if(eigen.info()!=Eigen::Success || eigen.eigenvalues()[1]<1e-12)return false;
   Eigen::Vector2d direction=eigen.eigenvectors().col(1);
   if(direction[std::abs(direction[0])>=std::abs(direction[1])?0:1]<0)direction=-direction;
+  const double wallTolerance=std::max(config.profileWallTolerance,config.hullSurfaceDistance);
+  const double repairReach=std::max(4.5*config.sliceStep,double(config.profileCurvatureRadius));
+  const bool footParameterization=std::all_of(rows.begin(),rows.end(),[](const Row &row){return row.hasFoot;});
+  std::vector<bool> measuredFoot(rows.size(),false);
+  for(std::size_t r=0;r<rows.size();++r)if(rows[r].hasFoot)
+    for(const auto &p:rows[r].points)
+      if(std::hypot(p[b]-rows[r].foot[b],p[c]-rows[r].foot[c])<=2*wallTolerance) {measuredFoot[r]=true;break;}
+  auto neighborFootSupport=[&](std::size_t r) {
+    std::size_t before=r,after=r;
+    while(before>0 && !measuredFoot[before-1])--before;
+    while(after+1<rows.size() && !measuredFoot[after+1])++after;
+    if(before==0 || after+1==rows.size())return false;
+    --before;++after;
+    const double first=sections[rows[before].section].station,last=sections[rows[after].section].station;
+    if(last<=first || last-first>repairReach)return false;
+    const double t=(sections[rows[r].section].station-first)/(last-first);
+    const Eigen::Vector3d foot=(1-t)*rows[before].foot+t*rows[after].foot;
+    return (foot-rows[r].foot).norm()<=2*wallTolerance;
+  };
   double maximumWidth=0;
   for(std::size_t r=0;r<rows.size();++r) {
     auto &row=rows[r];
@@ -118,12 +148,32 @@ bool fitRun(std::vector<Row> &rows,const std::vector<SurfaceSection> &sections,
         row.arc[j]=row.arc[j-1]+std::hypot(d[b],d[c]);
       }
       if(row.arc.back()<1e-6)return false;
-      row.contourLength=row.arc.back();for(auto &t:row.arc)t/=row.contourLength;
+      row.contourLength=row.arc.back();
+      if(row.hasFoot) {
+        const double t=projection(row.foot),first=projection(row.points.front()),last=projection(row.points.back());
+        row.footAtStart=t<first;
+        if(t>=first && t<=last)row.hasFoot=false;
+        else {
+          const auto &edge=row.footAtStart?row.points.front():row.points.back();
+          const Eigen::Vector2d delta(row.foot[b]-edge[b],row.foot[c]-edge[c]);
+          // Only close a short gap towards a supported wall foot. Do not
+          // stretch across a detached sheet or extend the outer wall rim.
+          if(delta.norm()>repairReach || (std::abs(row.footNormal.dot(delta))>2*wallTolerance && !neighborFootSupport(r)) ||
+              (config.interiorOpeningDirection && delta.y()*config.interiorOpeningDirection>0))row.hasFoot=false;
+          else {
+            row.contourLength+=delta.norm();
+            if(row.footAtStart)for(auto &arc:row.arc)arc+=delta.norm();
+          }
+        }
+      }
+      for(auto &t:row.arc)t/=row.contourLength;
     }
     maximumWidth=std::max(maximumWidth,row.contourLength);
     if(r) {
       // Transverse variation of a cropped wall must not invent longitudinal support.
-      const double step=(row.center-rows[r-1].center).norm();
+      // When every section has a reliable foot, a cropped wall must not make
+      // the longitudinal parameter wander with its changing measured center.
+      const double step=footParameterization ? (row.foot-rows[r-1].foot).norm() : (row.center-rows[r-1].center).norm();
       if(step<1e-6)return false;
       row.u=rows[r-1].u+step;
     }
@@ -140,7 +190,7 @@ bool fitRun(std::vector<Row> &rows,const std::vector<SurfaceSection> &sections,
   Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> rank(cov);
   if(rank.info()!=Eigen::Success || rank.eigenvalues()[1]<1e-10*rank.eigenvalues()[2])return false;
   const double spacing=std::max(1.,8.*config.profileBinSize);
-  out.countU=std::min(int(rows.size()),std::max(4,std::min(32,int(std::ceil(length/spacing))+3)));
+  out.countU=std::min(int(rows.size()),std::max(minimumControlsU,std::min(32,int(std::ceil(length/spacing))+3)));
   // All subdivisions share the same transverse basis and boundary curves.
   out.countV=12;
   out.knotsU=makeKnots(out.countU);out.knotsV=makeKnots(out.countV);
@@ -159,8 +209,11 @@ bool fitRun(std::vector<Row> &rows,const std::vector<SurfaceSection> &sections,
     const auto &row=rows[r];
     for(int k=0;k<columnCount;++k) {
       const double v=double(k)/(columnCount-1);
-      addSample(row.u,v,interpolate(row,v),1);
+      // Inferred boundary strips are fitting constraints, not measurements.
+      const bool inferred=v<row.arc.front() || v>row.arc.back();
+      addSample(row.u,v,interpolate(row,v),inferred?.25:1);
     }
+    if(row.hasFoot)addSample(row.u,row.footAtStart?0:1,row.foot,4);
     // Missing interior scans get low-weight constraints from both neighboring
     // measured contours. No endpoint extrapolation; large gaps split below.
     if(r) {
@@ -190,6 +243,13 @@ bool fitRun(std::vector<Row> &rows,const std::vector<SurfaceSection> &sections,
         rhs.row(i)+=bv[i]*p.transpose();
         for(int j=0;j<out.countV;++j)matrix(i,j)+=bv[i]*bv[j];
       }
+    }
+    if(row.hasFoot) {
+      const int corner=row.footAtStart?0:out.countV-1;
+      const Eigen::RowVector3d target=(row.foot-row.points.front()).transpose();
+      for(int j=0;j<out.countV;++j)if(j!=corner)rhs.row(j)-=matrix(j,corner)*target;
+      matrix.row(corner).setZero();matrix.col(corner).setZero();matrix(corner,corner)=1;
+      rhs.row(corner)=target;
     }
     const Eigen::MatrixXd edge=matrix.ldlt().solve(rhs);
     const int offset=end?(out.countU-1)*out.countV:0;
@@ -292,6 +352,14 @@ BSplineSurfaceModel fitSurfaceModel(const CloudT &source,
   fitPart=[&](std::vector<Row> part) {
     BSplineSurfacePatch patch;
     if(fitRun(part,sections,config,patch))model.patches.push_back(std::move(patch));
+    else if(patch.valid() && part.size()<7 && patch.countU<int(part.size())) {
+      // Five/six measured rows cannot be split into two cubic patches sharing
+      // an edge. Before dropping this supported strip, use the available rows
+      // as longitudinal controls. Keep the same boundary curves and RMS gate.
+      patch=BSplineSurfacePatch{};
+      if(fitRun(part,sections,config,patch,int(part.size())))model.patches.push_back(std::move(patch));
+      else ++model.rejectedPatchCount;
+    }
     else if(patch.valid() && part.size()>=7) {
       // A rapidly changing boundary can defeat one long chart. Subdivide at
       // a measured section. Both children use its identical fixed edge curve.
@@ -311,6 +379,14 @@ BSplineSurfaceModel fitSurfaceModel(const CloudT &source,
        (face==3 && !section.leftValid && !section.rightValid)) {flush();continue;}
     Row row;row.section=i;
     for(auto index:groups[i])if(labels[index]==face)row.points.push_back(toVector(source[index]).cast<double>());
+    if(face==1 || face==2) {
+      const auto &normal=face==1?section.leftNormal:section.rightNormal;
+      const bool uncertain=face==1?section.leftBoundaryUncertain:section.rightBoundaryUncertain;
+      const auto foot=toVector(face==1?section.left:section.right).cast<double>().eval();
+      if(!uncertain && normal.allFinite() && normal.squaredNorm()>.5f && foot.allFinite()) {
+        row.hasFoot=true;row.foot=foot;row.footNormal=normal.cast<double>().normalized();
+      }
+    }
     if(!rows.empty()) {
       const auto &previous=sections[rows.back().section],&current=sections[i];
       // Use physical neighborhood size, not a fixed frame count: dense scans

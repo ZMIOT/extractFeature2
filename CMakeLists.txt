@@ -22,7 +22,7 @@ endif()
 add_library(seam_core SHARED src/SeamDetector.cpp src/UniformSeamWidth.cpp src/InputSampling.cpp
   src/ProfileCurvature.cpp src/HullSurfaces.cpp src/SeamSmoother.cpp
   src/SeamHistory.cpp src/ConfigIO.cpp src/WeldSeam.cpp src/SurfaceClouds.cpp src/BSplineSurface.cpp
-  src/GpuSurfaceNormals.cpp)
+  src/GpuSurfaceNormals.cpp src/SeamDirection.cpp)
 set_target_properties(seam_core PROPERTIES OUTPUT_NAME WeldSeam EXPORT_NAME WeldSeam
   WINDOWS_EXPORT_ALL_SYMBOLS ON DEBUG_POSTFIX d AUTOMOC OFF)
 add_library(WeldSeam::WeldSeam ALIAS seam_core)
@@ -62,6 +62,11 @@ endif()
 
 if(BUILD_TESTING)
   enable_testing()
+  add_executable(seam_direction_test tests/test_seam_direction.cpp)
+  target_link_libraries(seam_direction_test PRIVATE seam_core seam_test_io)
+  target_compile_definitions(seam_direction_test PRIVATE SEAM_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+  add_test(NAME automatic_seam_direction COMMAND seam_direction_test)
+  list(APPEND _weld_targets seam_direction_test)
   # Existing regressions read measured TXT fixtures. This helper is not part of
   # the SDK and deliberately does not compile PCD/PLY backends or link pcl_io.
   add_library(seam_test_io STATIC src/PointCloudIO.cpp)

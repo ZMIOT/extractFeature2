@@ -283,6 +283,8 @@ void extractSurfaceClouds(const CloudT::ConstPtr &source,
     }
   }
   std::vector<unsigned char> labels(source->size(), 0);
+  std::vector<std::array<float,2>> floorBounds(sections.size(),
+      {{-std::numeric_limits<float>::infinity(),std::numeric_limits<float>::infinity()}});
   detail::GpuSurfaceNormals gpuNormalBatch;
   const bool gpuNormals=detail::computeSurfaceNormalsGpu(
       *source,groups,u,v,radius,gpuNormalBatch);
@@ -416,6 +418,10 @@ void extractSurfaceClouds(const CloudT::ConstPtr &source,
     }
     if(!section.leftValid)planes[0].valid=false;
     if(!section.rightValid)planes[1].valid=false;
+    // A two-wall floor ends at the measured feet, even when the infinite
+    // fitted wall planes would also admit an exterior sheet or shoulder.
+    if(planes[0].valid)floorBounds[s][0]=left.x();
+    if(planes[1].valid)floorBounds[s][1]=right.x();
     const bool recoveredSection=section.leftBoundaryUncertain || section.rightBoundaryUncertain;
     const bool singleSide=recoveredSection ? planes[0].valid!=planes[1].valid : section.leftValid!=section.rightValid;
     const int presentSide=recoveredSection? (planes[0].valid?0:1) : (section.leftValid?0:1);
@@ -524,8 +530,8 @@ void extractSurfaceClouds(const CloudT::ConstPtr &source,
     }
   }
   // Use detector stations, not raw X or frame-vector offsets: original scans
-  // may be tilted or reversed. Each wall keeps its own end; the floor closes
-  // along the line between those ends in station/transverse coordinates.
+  // may be tilted or reversed. Each wall keeps its own end; a two-wall floor
+  // stops at their common end instead of projecting past the shorter wall.
   if(config.limitSurfaceEndsToTracks && ends) {
     const auto &left=(*ends)[0], &right=(*ends)[1];
     for(std::size_t s=0;s<groups.size();++s)for(auto index:groups[s]) {
@@ -537,16 +543,46 @@ void extractSurfaceClouds(const CloudT::ConstPtr &source,
       if(label==3 && (left.valid || right.valid)) {
         limited=true;
         stop=left.valid?left.station:right.station;
-        if(left.valid && right.valid) {
-          const float width=right.point.data[u]-left.point.data[u];
-          const float fraction=std::abs(width)>1.e-5f
-              ? std::max(0.f,std::min(1.f,((*source)[index].data[u]-left.point.data[u])/width)) : 0.f;
-          stop=std::abs(width)>1.e-5f ? left.station+fraction*(right.station-left.station)
-                                    : std::min(left.station,right.station);
-        }
+        if(left.valid && right.valid)stop=std::min(left.station,right.station);
       }
       if(limited && sections[s].station>stop+1.e-4f)labels[index]=0;
     }
+  }
+  // On a two-wall workpiece, the floor only exists over the common measured
+  // wall span. Apply this after recovery and endpoint clipping: otherwise a
+  // single-side floor trace can leave a tongue beyond either wall at either
+  // end. An actual single-wall scan keeps its connected measured floor.
+  std::array<std::size_t,2> first{{groups.size(),groups.size()}},last{{0,0}};
+  for(std::size_t s=0;s<groups.size();++s)for(auto index:groups[s]) {
+    const auto label=labels[index];
+    if(label==1 || label==2) {
+      first[label-1]=std::min(first[label-1],s);
+      last[label-1]=std::max(last[label-1],s);
+    }
+  }
+  const bool twoWalls=first[0]<groups.size() && first[1]<groups.size();
+  const auto floorBegin=std::max(first[0],first[1]),floorEnd=std::min(last[0],last[1]);
+  if(twoWalls)for(int side=0;side<2;++side) {
+    std::size_t previous=groups.size();
+    for(std::size_t s=0;s<groups.size();++s)if(std::isfinite(floorBounds[s][side])) {
+      // Only bridge a short loss of wall support inside two measured feet.
+      // Never extrapolate a missing side from the other side's open floor.
+      if(previous<groups.size() && s>previous+1) {
+        const float span=sections[s].station-sections[previous].station;
+        if(span>0 && span<=std::max(4.5f*config.sliceStep,config.profileCurvatureRadius))
+          for(auto i=previous+1;i<s;++i) {
+            const float t=(sections[i].station-sections[previous].station)/span;
+            floorBounds[i][side]=(1-t)*floorBounds[previous][side]+t*floorBounds[s][side];
+          }
+      }
+      previous=s;
+    }
+  }
+  for(std::size_t s=0;s<groups.size();++s)for(auto index:groups[s])if(labels[index]==3) {
+    const float across=(*source)[index].data[u];
+    if((twoWalls && (s<floorBegin || s>floorEnd ||
+         !std::isfinite(floorBounds[s][0]) || !std::isfinite(floorBounds[s][1]))) ||
+        across<=floorBounds[s][0] || across>=floorBounds[s][1])labels[index]=0;
   }
   // Preserve original order and exact XYZ, including legitimate repeated
   // samples. Distinct output clouds never share a source index.

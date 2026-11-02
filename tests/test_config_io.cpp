@@ -21,6 +21,8 @@ int main() {
   a.historyWeight = 8.5f;
   a.inputVoxelSize = .1f;
   a.limitSurfaceEndsToTracks = false;
+  a.autoLongitudinalAxis = false;
+  a.autoOpeningDirection = false;
   original.algorithms.set(weld::ProfileLocalizationMethod::CurvatureCandidates, a);
   std::string error;
   CHECK(weld::saveLibraryConfig(path, original, &error));
@@ -30,6 +32,7 @@ int main() {
   CHECK(b.curveLineFallback.search.continuityWeight == 4.5f && b.historyWeight == 8.5f);
   CHECK(b.inputVoxelSize == .1f);
   CHECK(!b.limitSurfaceEndsToTracks);
+  CHECK(!b.autoLongitudinalAxis && !b.autoOpeningDirection);
   CHECK(loaded.algorithms.get(weld::ProfileLocalizationMethod::CurveLineIntersection).minSeamSeparation == 8);
   const auto second = prefix + "_second.json";
   CHECK(weld::saveLibraryConfig(second, loaded, &error));

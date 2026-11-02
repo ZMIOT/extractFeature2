@@ -32,6 +32,7 @@
 #include "HullSurfaces.h"
 #include "SurfaceClouds.h"
 #include "InputSampling.h"
+#include "SeamDirection.h"
 #include "CandidateExecutor.h"
 
 #include <pcl/common/common.h>
@@ -5191,6 +5192,8 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
                                 DebugTrace *debug, const std::vector<ScanFrameRange> *frames,
                                 bool generateSurfaceModels) const {
   SeamResult result;
+  result.resolvedLongitudinalAxis = config.longitudinalAxis;
+  result.resolvedOpeningDirection = config.interiorOpeningDirection;
   auto stageStarted = std::chrono::steady_clock::now();
   auto finishStage = [&](const std::string &name) {
     const auto now = std::chrono::steady_clock::now();
@@ -5324,6 +5327,37 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
     } else surfaceInput=input;
   }
   finishStage("main_body");
+  CloudT::Ptr directionPreprocessed;
+  if (config.autoLongitudinalAxis || config.autoOpeningDirection) {
+    if (!config.extractMainBody && !frameBased)
+      directionPreprocessed=preprocess(sourceInput, workingConfig, debug);
+    const auto directionCloud = config.extractMainBody || frameBased
+        ? sourceInput : CloudT::ConstPtr(directionPreprocessed);
+    const auto direction = estimateSeamDirection(*directionCloud, workingConfig,
+        frameBased ? (config.extractMainBody ? &bodyFrames : detectionFrames) : nullptr);
+    workingConfig.longitudinalAxis = direction.axis;
+    if (config.autoOpeningDirection && direction.openingReliable)
+      workingConfig.interiorOpeningDirection = direction.opening;
+    result.resolvedLongitudinalAxis = workingConfig.longitudinalAxis;
+    result.resolvedOpeningDirection = workingConfig.interiorOpeningDirection;
+    result.principalDirection = direction.principalDirection;
+    result.automaticAxisReliable = config.autoLongitudinalAxis && direction.axisReliable;
+    result.automaticOpeningReliable = config.autoOpeningDirection && direction.openingReliable;
+    result.directionSummary = std::string("焊缝方向：") + "XYZ"[int(direction.axis)] +
+        "；槽口：" + (workingConfig.interiorOpeningDirection>0 ? "+V" :
+                        workingConfig.interiorOpeningDirection<0 ? "-V" : "不限方向");
+    if (config.autoLongitudinalAxis && !direction.axisReliable)
+      result.directionSummary += "；PCA 主方向不明确，延伸轴使用备用设置";
+    if (config.autoOpeningDirection && !direction.openingReliable)
+      result.directionSummary += "；槽口投票不足或不一致，朝向使用备用设置";
+    if (debug) debug->config = workingConfig;
+    publishDebugStep(debug, "H 自动焊接方向", {{"方向分析点云", directionCloud}}, result.directionSummary,
+        {{"pca_x", direction.principalDirection.x()}, {"pca_y", direction.principalDirection.y()},
+         {"pca_z", direction.principalDirection.z()}, {"pca_gap", direction.principalGap},
+         {"positive_opening_votes", double(direction.positiveVotes)},
+         {"negative_opening_votes", double(direction.negativeVotes)}});
+    finishStage("automatic_direction");
+  }
   std::vector<FrameProjection> frameProjections;
   std::vector<ScanFrameRange> processedFrames;
   CloudT::Ptr measuredFrames;
@@ -5369,7 +5403,7 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
                        {{"处理后点云", flattened}});
     }
   } else {
-    result.filteredCloud = preprocess(sourceInput, workingConfig, debug);
+    result.filteredCloud = directionPreprocessed ? directionPreprocessed : preprocess(sourceInput, workingConfig, debug);
     workingInput = result.filteredCloud;
   }
   if (!result.filteredCloud || result.filteredCloud->size() < 30) {
@@ -5471,12 +5505,12 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
                      {{"左焊缝", result.leftSeam}, {"右焊缝", result.rightSeam}});
   finishStage("final_curve");
   std::vector<float> endpointStations, rightEndpointStations;
-  for (const auto &p:*result.leftSeam) endpointStations.push_back(coordinate(p,config.longitudinalAxis));
-  for (const auto &p:*result.rightSeam) rightEndpointStations.push_back(coordinate(p,config.longitudinalAxis));
+  for (const auto &p:*result.leftSeam) endpointStations.push_back(coordinate(p,workingConfig.longitudinalAxis));
+  for (const auto &p:*result.rightSeam) rightEndpointStations.push_back(coordinate(p,workingConfig.longitudinalAxis));
   const auto widthDecision=classifySeamWidth(result,workingConfig);
   if (frameBased) {
     restoreOriginalFrameGeometry(result, outputFrameIds, frameProjections,
-                                 config.longitudinalAxis);
+                                 workingConfig.longitudinalAxis);
     result.filteredCloud.reset(new CloudT(*sourceInput));
   }
   // Capture measured surface sections before trajectory-only endpoint cuts.
@@ -5485,14 +5519,14 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
   // requires measured support in each original section; it does not extrapolate.
   // Join by detector station, never by vector index, for unequal side tracks.
   std::map<float,SurfaceSection> joined;
-  const int across=transverseAxes(config.longitudinalAxis)[0];
+  const int across=transverseAxes(workingConfig.longitudinalAxis)[0];
   for(int side=0;side<2;++side) {
     const auto &cloud=side?*result.rightSeam:*result.leftSeam;
     const auto &quality=side?result.rightPointQuality:result.leftPointQuality;
     const auto &ids=side?result.rightFrameIndices:result.leftFrameIndices;
     for(std::size_t i=0;i<paths[side].size();++i) {
       const auto &candidate=paths[side][i];
-      const float station=coordinate(candidate.point,config.longitudinalAxis);
+      const float station=coordinate(candidate.point,workingConfig.longitudinalAxis);
       auto inserted=joined.emplace(station,SurfaceSection{});
       auto &section=inserted.first->second;
       if(inserted.second) {section.leftValid=section.rightValid=false;section.station=station;}
@@ -5533,7 +5567,7 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
     std::map<float,std::size_t> byStation;
     for(std::size_t i=0;i<recoverySections.size();++i)byStation.emplace(recoverySections[i].station,i);
     if(debug)for(const auto &pair:toes)for(int side=0;side<2;++side)if(pair[side].valid) {
-      auto p=pair[side].point;p.data[int(config.longitudinalAxis)]=pair[side].station;
+      auto p=pair[side].point;p.data[int(workingConfig.longitudinalAxis)]=pair[side].station;
       debug->measuredWallFeet[side].push_back(p);
     }
     for(auto &entry:joined)entry.second.leftBoundaryUncertain=entry.second.rightBoundaryUncertain=false;
@@ -5558,7 +5592,7 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
         q.flags|=QualityMeasuredWallFoot;
         (*cloud)[i]=toe.point;
         paths[side][i].point=toe.point;
-        paths[side][i].point.data[int(config.longitudinalAxis)]=stations[i];
+        paths[side][i].point.data[int(workingConfig.longitudinalAxis)]=stations[i];
         auto &section=joined.at(stations[i]);
         (side?section.right:section.left)=toe.point;
         (side?section.rightBoundaryUncertain:section.leftBoundaryUncertain)=true;
@@ -5595,7 +5629,7 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
   for(int side=0;side<2;++side) {
     const auto begin=result.sideEndpointTrimmedStart[side],end=paths[side].size()-result.sideEndpointTrimmedEnd[side];
     for(std::size_t i=0;i<paths[side].size();++i)if(i<begin || i>=end) {
-      auto &section=joined.at(coordinate(paths[side][i].point,config.longitudinalAxis));
+      auto &section=joined.at(coordinate(paths[side][i].point,workingConfig.longitudinalAxis));
       (side?section.rightBoundaryUncertain:section.leftBoundaryUncertain)=true;
     }
     paths[side]=std::vector<Candidate>(paths[side].begin()+begin,paths[side].begin()+end);
@@ -5616,7 +5650,7 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
   std::array<SurfaceEnd,2> surfaceEnds;
   for(int side=0;side<2;++side)if(!paths[side].empty()) {
     surfaceEnds[side].valid=true;
-    surfaceEnds[side].station=coordinate(paths[side].back().point,config.longitudinalAxis);
+    surfaceEnds[side].station=coordinate(paths[side].back().point,workingConfig.longitudinalAxis);
     surfaceEnds[side].point=(side?result.rightSeam:result.leftSeam)->back();
   }
   extractSurfaceClouds(surfaceInput,surfaceSections,workingConfig,result,
@@ -5625,12 +5659,12 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
   finishStage("surface_extraction");
   const bool alignedSides=leftPath.size()==rightPath.size() &&
       std::equal(leftPath.begin(),leftPath.end(),rightPath.begin(),[&](const Candidate &l,const Candidate &r) {
-        return std::fabs(coordinate(l.point,config.longitudinalAxis)-coordinate(r.point,config.longitudinalAxis))<1.e-4f;
+        return std::fabs(coordinate(l.point,workingConfig.longitudinalAxis)-coordinate(r.point,workingConfig.longitudinalAxis))<1.e-4f;
       });
   if(config.uniformWidthEnabled && alignedSides) {
     std::vector<UniformWidthSection> sections(leftPath.size());
     for(std::size_t i=0;i<leftPath.size();++i) {
-      const float station=coordinate(leftPath[i].point,config.longitudinalAxis);
+      const float station=coordinate(leftPath[i].point,workingConfig.longitudinalAxis);
       auto slice=std::lower_bound(slices.begin(),slices.end(),station,
           [](const Slice &s,float x){return s.station<x;});
       if(slice==slices.end() || std::fabs(slice->station-station)>1.e-4f)continue;
@@ -5640,9 +5674,9 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
         auto plane=std::lower_bound(frameProjections.begin(),frameProjections.end(),slice->frameIndex,
             [](const FrameProjection &p,int id){return p.frameIndex<id;});
         if(plane==frameProjections.end() || plane->frameIndex!=slice->frameIndex) {sections[i].contour.clear();continue;}
-        for(auto &p:sections[i].contour)p=restoreFramePoint(p,*plane,config.longitudinalAxis);
-        sections[i].sourceLeft=restoreFramePoint(sections[i].sourceLeft,*plane,config.longitudinalAxis);
-        sections[i].sourceRight=restoreFramePoint(sections[i].sourceRight,*plane,config.longitudinalAxis);
+        for(auto &p:sections[i].contour)p=restoreFramePoint(p,*plane,workingConfig.longitudinalAxis);
+        sections[i].sourceLeft=restoreFramePoint(sections[i].sourceLeft,*plane,workingConfig.longitudinalAxis);
+        sections[i].sourceRight=restoreFramePoint(sections[i].sourceRight,*plane,workingConfig.longitudinalAxis);
       }
     }
     applyUniformSeamWidth(result,workingConfig,sections);
@@ -5694,7 +5728,7 @@ SeamResult SeamDetector::detect(const CloudT::ConstPtr &input,
     result.summary+=" Uniform-width final filter: length="+std::to_string(config.uniformWidthFilterLength)+
         ", mean correction="+std::to_string(result.uniformWidthFilterMeanCorrection)+
         ", max correction="+std::to_string(result.uniformWidthFilterMaxCorrection)+".";
-  if(!config.uniformWidthEnabled && alignedSides)applySeamWidthRule(result,config,&widthDecision);
+  if(!config.uniformWidthEnabled && alignedSides)applySeamWidthRule(result,workingConfig,&widthDecision);
   result.summary+=" Surface points L/R/weld="+std::to_string(result.leftSurface->size())+"/"+
       std::to_string(result.rightSurface->size())+"/"+std::to_string(result.weldSurface->size())+".";
   result.summary+=" B-spline patches L/weld/R="+std::to_string(result.leftSurfaceModel.patches.size())+"/"+
