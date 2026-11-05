@@ -53,6 +53,7 @@ int main(int argc, char **argv) {
     auto *wallTolerance = window.findChild<QDoubleSpinBox *>("profileWallTolerance");
     auto *widthRule = window.findChild<QCheckBox *>("adaptiveSeamCount");
     auto *surfaceModels = window.findChild<QCheckBox *>("generateSurfaceModels");
+    auto *rimRepair = window.findChild<QDoubleSpinBox *>("surfaceRimRepairLength");
     auto *doubleWidth = window.findChild<QDoubleSpinBox *>("doubleSeamWidth");
     auto *debugStart = window.findChild<QSpinBox *>("debugStartSlice");
     auto *debugPosition = window.findChild<QLabel *>("debugSlicePosition");
@@ -62,6 +63,7 @@ int main(int argc, char **argv) {
         maxCorrection && floorRms && turn && localization && spline && trim &&
         radius && beadHeight && beadWidth && regionLength && regionFraction && wallTolerance && widthRule && doubleWidth &&
         debugStart && debugPosition && surfaceModels && surfaceModels->isChecked() &&
+        rimRepair && rimRepair->value()==24 &&
         autoAxis && autoOpening && autoAxis->isChecked() && autoOpening->isChecked() &&
         !surface->isChecked() && !widthRule->isChecked() &&
         turn->count() == 5 && turn->currentIndex() == 4 &&
@@ -157,6 +159,8 @@ int main(int argc, char **argv) {
       window.findChild<QComboBox *>("uniformWidthMetric")->setCurrentIndex(option("--uniform-width")=="arc"?0:1);
     }
     const auto debugStart = option("--debug-start");
+    if(!option("--surface-rim-repair-length").isEmpty())
+      window.findChild<QDoubleSpinBox *>("surfaceRimRepairLength")->setValue(option("--surface-rim-repair-length").toDouble());
     const auto debugJump = option("--debug-jump");
     const auto debugJumpBack = option("--debug-jump-back");
     // Exercise the real modal VTK loop in unattended integration checks.

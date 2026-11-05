@@ -126,6 +126,7 @@ QJsonObject configJson(const DetectorConfig &c) {
   PARAM(curveRegularizationWeight);
   PARAM(trimUnstableEndpoints);
   PARAM(limitSurfaceEndsToTracks);
+  PARAM(surfaceRimRepairLength);
   PARAM(minimumFeatureDepth);
   PARAM(endpointTrimAngleDegrees);
   PARAM(endpointTrimWindow);

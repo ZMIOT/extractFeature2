@@ -370,6 +370,8 @@ struct DetectorConfig {
   bool trimUnstableEndpoints = true;
   // Stop each side face at its own trajectory end; floor support is independent.
   bool limitSurfaceEndsToTracks = true;
+  // Model-only rim repair defaults to 24 input units; 0 preserves measured outer boundaries.
+  float surfaceRimRepairLength = 24;
   /** @brief 端点截断检查窗口（长度）。 @details 默认 12.0f；有效范围 0.000001..1000000000。 */
   float endpointTrimWindow = 12.0f;
   /** @brief 端点持续弯折阈值（度）。 @details 默认 20.0f；有效范围 0.000001..89.9999。 */

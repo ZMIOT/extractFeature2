@@ -54,6 +54,7 @@ int main(int argc, char **argv) {
         << "  --no-uniform-width-filter  --uniform-width-filter-length 12\n"
         << "  --no-endpoint-trim  --endpoint-window 12  --endpoint-angle 20  --endpoint-deviation 1.5\n"
         << "  --independent-surface-ends (retain measured walls beyond trajectory ends; floor is always independent)\n"
+        << "  --surface-rim-repair-length 24 (model-only outer rim repair; maximum span in input units, 0 disables)\n"
         << "  --final-smoothing-length 12  --final-robust-scale 0.6\n"
         << "  --profile-curvature-radius 8  --no-profile-curvature\n"
         << "  --localization curve-line|curvature (default curvature)\n"
@@ -129,6 +130,7 @@ int main(int argc, char **argv) {
       {"--endpoint-window", &config.endpointTrimWindow},
       {"--endpoint-angle", &config.endpointTrimAngleDegrees},
       {"--endpoint-deviation", &config.endpointTrimDeviation},
+      {"--surface-rim-repair-length", &config.surfaceRimRepairLength},
       {"--final-smoothing-length", &config.finalSmoothingLength},
       {"--uniform-width-filter-length", &config.uniformWidthFilterLength},
       {"--profile-curvature-radius", &config.profileCurvatureRadius},

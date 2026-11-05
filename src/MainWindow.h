@@ -65,6 +65,7 @@ private:
   std::array<pcl::PolygonMesh,3> surfaceMeshes_;
   QCheckBox *trimEndpoints_ = nullptr;
   QCheckBox *limitSurfaceEnds_ = nullptr;
+  QDoubleSpinBox *surfaceRimRepairLength_ = nullptr;
   QCheckBox *generateSurfaceModels_ = nullptr;
   QDoubleSpinBox *minimumFeatureDepth_ = nullptr;
   QDoubleSpinBox *endpointAngle_ = nullptr, *endpointWindow_ = nullptr, *endpointDeviation_ = nullptr;

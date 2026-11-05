@@ -374,6 +374,8 @@ void MainWindow::buildUi() {
   limitSurfaceEnds_->setObjectName("limitSurfaceEndsToTracks");
   limitSurfaceEnds_->setToolTip(QStringLiteral("左右侧壁分别停在各自轨迹终点；底面独立按实测支撑保留，不随较短侧壁截断。取消后侧壁也可保留轨迹终点之外仍有实测支持的部分。"));
   connect(limitSurfaceEnds_,&QCheckBox::toggled,this,[this] { invalidateResult(); });
+  surfaceRimRepairLength_ = spin(0,1000000000,1,QStringLiteral("默认 24，0 关闭。大于 0 时，以两端可靠侧壁补上跨度不超过此值的上缘凹口，仅改变拟合曲面，不增加实测点。无法仅靠点云区分真实凹口与扫描缺失，需保留真实凹口时请关闭。"));
+  surfaceRimRepairLength_->setObjectName("surfaceRimRepairLength");
   inputVoxel_ = spin(0, 1000000000, .001, QStringLiteral("直接输入降采样 size，支持最多六位小数，0 关闭。主体分析使用采样点，面提取恢复主体范围内的原始密集点。有原始帧时，轨迹也恢复原始轮廓，帧几何不随采样改变；无帧号时轨迹检测使用采样点。较大的 size 仍可能改变主体范围。"));
   inputVoxel_->setObjectName("inputVoxelSize");
   inputVoxel_->setDecimals(6);
@@ -480,6 +482,7 @@ void MainWindow::buildUi() {
   extra->addRow(QStringLiteral("双道宽度阈值"), doubleSeamWidth_);
   extra->addRow(trimEndpoints_);
   extra->addRow(limitSurfaceEnds_);
+  extra->addRow(QStringLiteral("上缘补面最大跨度（0 关闭）"),surfaceRimRepairLength_);
   endpointAngle_=spin(1,89,1,QStringLiteral("首尾相邻两段轨迹的方向变化阈值（度），越小越早停止。"));
   endpointWindow_=spin(1,100,1,QStringLiteral("首尾检测的物理窗口长度，单位与点云一致。从中间参考段向两端查找持续异常，短轨迹不强行裁剪。"));
   endpointDeviation_=spin(.1,20,.1,QStringLiteral("允许首尾轨迹相对稳定趋势的变动范围；超出后还需满足转角和持续长度条件才会截断。单位与点云一致。"));
@@ -844,6 +847,7 @@ void MainWindow::applyConfig(const DetectorConfig &c) {
   surfaceEnabled_->setChecked(c.useSurfaceRefinement);
   trimEndpoints_->setChecked(c.trimUnstableEndpoints);
   limitSurfaceEnds_->setChecked(c.limitSurfaceEndsToTracks);
+  surfaceRimRepairLength_->setValue(c.surfaceRimRepairLength);
   endpointAngle_->setValue(c.endpointTrimAngleDegrees); endpointWindow_->setValue(c.endpointTrimWindow);
   endpointDeviation_->setValue(c.endpointTrimDeviation);
   endpointAngle_->setEnabled(c.trimUnstableEndpoints); endpointWindow_->setEnabled(c.trimUnstableEndpoints); endpointDeviation_->setEnabled(c.trimUnstableEndpoints);
@@ -938,6 +942,7 @@ DetectorConfig MainWindow::currentConfig() const {
   c.useSurfaceRefinement = surfaceEnabled_->isChecked();
   c.trimUnstableEndpoints=trimEndpoints_->isChecked();
   c.limitSurfaceEndsToTracks=limitSurfaceEnds_->isChecked();
+  c.surfaceRimRepairLength=surfaceRimRepairLength_->value();
   c.endpointTrimAngleDegrees=float(endpointAngle_->value()); c.endpointTrimWindow=float(endpointWindow_->value());
   c.endpointTrimDeviation=float(endpointDeviation_->value());
   c.finalSmoothingEnabled = finalSmoothing_->isChecked();

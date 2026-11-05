@@ -193,6 +193,62 @@ void wallFootGapTest(weld::Axis axis,int opening,bool framed,bool curved=false) 
   }
 }
 
+void outerRimRepairTest(weld::Axis axis,int opening,bool framed,int missingKind) {
+  weld::CloudT cloud;std::vector<weld::SurfaceSection> sections;
+  std::vector<std::vector<std::size_t>> groups;std::vector<unsigned char> labels;
+  weld::DetectorConfig config;config.longitudinalAxis=axis;config.interiorOpeningDirection=opening;
+  config.sliceStep=1;config.profileCurvatureRadius=8;
+  const int a=int(axis),b=a==0?1:0,c=a==2?1:2;
+  auto point=[&](float station,float h) {
+    weld::PointT p;p.data[b]=8+.5f*h;p.data[c]=opening*h;
+    p.data[a]=framed?-station+.15f*p.data[b]:station;return p;
+  };
+  for(int r=0;r<40;++r) {
+    weld::SurfaceSection s;s.station=float(r);s.frameIndex=r;
+    s.right=point(float(r),0);s.rightNormal=Eigen::Vector2f(1,-.5f*opening).normalized();
+    const bool missing=missingKind==1?(r>=10 && r<=29):missingKind==2?r<=5:(r>=12 && r<=18);
+    if(missingKind==3 && missing)s.rightBoundaryUncertain=true;
+    sections.push_back(s);groups.emplace_back();
+    for(int j=2;j<=(missing?25:100);++j) {
+      groups.back().push_back(cloud.size());labels.push_back(2);cloud.push_back(point(float(r),.1f*j));
+    }
+  }
+  config.surfaceRimRepairLength=0;
+  const auto original=weld::fitSurfaceModel(cloud,groups,sections,labels,2,config);
+  require(original.valid(),"Rim fixture did not fit");
+  config.surfaceRimRepairLength=20;
+  const auto repaired=weld::fitSurfaceModel(cloud,groups,sections,labels,2,config);
+  require(repaired.valid() && repaired.rejectedPatchCount==0,"Rim repair lost supported patches");
+  if(missingKind!=0) {
+    require(repaired.patches.size()==original.patches.size(),"Protected rim boundary changed patch coverage");
+    for(std::size_t i=0;i<original.patches.size();++i)
+      require(repaired.patches[i].controlPoints==original.patches[i].controlPoints,
+              "Rim repair altered an endpoint, long gap or uncertain boundary");
+  }
+  bool lowMiddle=false;
+  for(const auto &patch:repaired.patches)for(int i=0;i<=80;++i) {
+    Eigen::Vector3d p,q;
+    require(patch.evaluate(i/80.,0,p) && patch.evaluate(i/80.,1,q),"Rim edge is singular");
+    const auto &rim=opening*p[c]>opening*q[c]?p:q;
+    const auto &foot=opening*p[c]>opening*q[c]?q:p;
+    const double station=framed?-rim[a]+.15*rim[b]:rim[a];
+    require(std::abs(foot[c])<.3,"Rim repair displaced the wall foot");
+    if(missingKind==0)require(opening*rim[c]<=10.4,"Rim repair overshot supported outer boundary");
+    require(std::abs(rim[b]-8-.5*opening*rim[c])<.1,"Rim repair left neighboring wall geometry");
+    if(missingKind==0)require(opening*rim[c]>9.5,"Bounded outer rim notch was not repaired");
+    else if((missingKind==2?station<3:missingKind==1?(station>15 && station<24):(station>13 && station<17)) && opening*rim[c]<5)
+      lowMiddle=true;
+  }
+  if(missingKind!=0)require(lowMiddle,"Rim repair bridged an endpoint, long gap or uncertain boundary");
+  if(missingKind==0) {
+    std::size_t count=0;for(const auto &p:repaired.patches)count+=p.sampleCount;
+    require(repaired.patches.size()==1 && count==cloud.size(),"Inferred rim samples were counted as measurements");
+    Eigen::Vector3d p,q;
+    require(original.patches.front().evaluate(.38,0,p) && original.patches.front().evaluate(.38,1,q),"Original rim evaluation failed");
+    require(std::max(opening*p[c],opening*q[c])<8,"Disabled rim option altered the original notch");
+  }
+}
+
 void shortSupportedStripTest() {
   weld::CloudT cloud;std::vector<weld::SurfaceSection> sections;
   std::vector<std::vector<std::size_t>> groups;std::vector<unsigned char> labels;
@@ -228,6 +284,9 @@ int main() {
     for(bool framed:{false,true})for(bool vertical:{false,true})holesTest(framed,vertical);
     denseFrameHoleTest();
     shortSupportedStripTest();
+    for(auto axis:{weld::Axis::X,weld::Axis::Y,weld::Axis::Z})
+      for(int opening:{-1,1})for(bool framed:{false,true})outerRimRepairTest(axis,opening,framed,0);
+    for(int kind:{1,2,3})outerRimRepairTest(weld::Axis::X,1,false,kind);
     for(auto axis:{weld::Axis::X,weld::Axis::Y,weld::Axis::Z})
       for(int opening:{-1,1})for(bool framed:{false,true})wallFootGapTest(axis,opening,framed);
     wallFootGapTest(weld::Axis::X,1,true,true);

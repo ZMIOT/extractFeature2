@@ -21,6 +21,7 @@ int main() {
   a.historyWeight = 8.5f;
   a.inputVoxelSize = .1f;
   a.limitSurfaceEndsToTracks = false;
+  a.surfaceRimRepairLength = 0;
   a.autoLongitudinalAxis = false;
   a.autoOpeningDirection = false;
   original.algorithms.set(weld::ProfileLocalizationMethod::CurvatureCandidates, a);
@@ -32,6 +33,7 @@ int main() {
   CHECK(b.curveLineFallback.search.continuityWeight == 4.5f && b.historyWeight == 8.5f);
   CHECK(b.inputVoxelSize == .1f);
   CHECK(!b.limitSurfaceEndsToTracks);
+  CHECK(b.surfaceRimRepairLength == 0);
   CHECK(!b.autoLongitudinalAxis && !b.autoOpeningDirection);
   CHECK(loaded.algorithms.get(weld::ProfileLocalizationMethod::CurveLineIntersection).minSeamSeparation == 8);
   const auto second = prefix + "_second.json";
@@ -63,6 +65,8 @@ int main() {
   CHECK(weld::loadLibraryConfig(path, loaded, &error)); CHECK(error.empty());
   CHECK(loaded.algorithms.get(loaded.activeAlgorithm).minSeamSeparation == 6);
   CHECK(loaded.algorithms.get(loaded.activeAlgorithm).limitSurfaceEndsToTracks);
+  CHECK(loaded.algorithms.get(loaded.activeAlgorithm).surfaceRimRepairLength == 24);
+  CHECK(loaded.algorithms.get(weld::ProfileLocalizationMethod::CurveLineIntersection).surfaceRimRepairLength == 24);
   // The shipped file must remain equivalent to the library's built-in defaults.
   weld::LibraryConfig shipped;
   CHECK(weld::loadLibraryConfig(SEAM_DEFAULT_CONFIG, shipped, &error));

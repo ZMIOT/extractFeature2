@@ -70,8 +70,18 @@ struct Row {
   bool hasFoot=false,footAtStart=false;
   Eigen::Vector3d foot=Eigen::Vector3d::Zero();
   Eigen::Vector2d footNormal=Eigen::Vector2d::Zero();
+  bool hasRim=false,rimAtStart=false;
+  Eigen::Vector3d rim=Eigen::Vector3d::Zero();
 };
 Eigen::Vector3d interpolate(const Row &row,double t) {
+  if(row.hasRim && row.rimAtStart && t<row.arc.front()) {
+    const double w=t/row.arc.front();
+    return (1-w)*row.rim+w*row.points.front();
+  }
+  if(row.hasRim && !row.rimAtStart && t>row.arc.back()) {
+    const double w=(t-row.arc.back())/(1-row.arc.back());
+    return (1-w)*row.points.back()+w*row.rim;
+  }
   if(row.hasFoot && row.footAtStart && t<row.arc.front()) {
     const double w=t/row.arc.front();
     return (1-w)*row.foot+w*row.points.front();
@@ -86,6 +96,81 @@ Eigen::Vector3d interpolate(const Row &row,double t) {
   const auto j=std::size_t(it-row.arc.begin());
   const double weight=(t-row.arc[j-1])/(row.arc[j]-row.arc[j-1]);
   return (1-weight)*row.points[j-1]+weight*row.points[j];
+}
+// Optional reconstruction, not measured-point recovery. Use only original
+// neighboring wall rims and accepted feet; never use a repaired rim as an
+// anchor. The operator enables this because a real notch and a scan dropout
+// can have the same observed boundary.
+void repairRims(std::vector<Row> &rows,const std::vector<SurfaceSection> &sections,
+                const DetectorConfig &config) {
+  const double reach=config.surfaceRimRepairLength;
+  if(reach<=0 || rows.size()<7 || !config.interiorOpeningDirection)return;
+  const int a=int(config.longitudinalAxis),b=a==0?1:0,c=a==2?1:2;
+  const double tolerance=std::max(config.profileWallTolerance,config.hullSurfaceDistance);
+  const double depthLimit=std::min(.5*reach,2.*config.profileCurvatureRadius);
+  std::vector<Eigen::Vector3d> rim(rows.size(),Eigen::Vector3d::Zero());
+  std::vector<double> width(rows.size(),0),best(rows.size(),0);
+  std::vector<bool> valid(rows.size(),false);
+  auto transverse=[&](const Eigen::Vector3d &p){return Eigen::Vector2d(p[b],p[c]);};
+  auto station=[&](std::size_t i){return double(sections[rows[i].section].station);};
+  for(std::size_t i=0;i<rows.size();++i)if(rows[i].hasFoot) {
+    for(const auto &p:rows[i].points) {
+      const double length=transverse(p-rows[i].foot).norm();
+      if(length>width[i]) {width[i]=length;rim[i]=p;}
+    }
+    valid[i]=width[i]>2*tolerance &&
+        (rim[i][c]-rows[i].foot[c])*config.interiorOpeningDirection>tolerance;
+    best[i]=width[i];
+  }
+  auto stable=[&](std::size_t edge,int step) {
+    for(int j=1;j<=2;++j) {
+      const auto i=std::size_t(int(edge)+step*j);
+      const double span=std::abs(station(i)-station(edge));
+      if(!valid[i] || span<=0 || span>reach ||
+         std::abs(width[i]-width[edge])>tolerance+.5*span)return false;
+    }
+    return true;
+  };
+  for(std::size_t left=2;left+4<rows.size();++left) {
+    if(!valid[left] || !stable(left,-1))continue;
+    for(std::size_t right=left+2;right+2<rows.size();++right) {
+      const double span=station(right)-station(left);
+      if(span>reach)break;
+      if(span<=0 || !valid[right] || !stable(right,1))continue;
+      // Both shoulders must have comparable extent. Otherwise a wide missing
+      // region could be partially filled from its low interior as if that
+      // interior were a second shoulder, evading the maximum-span limit.
+      if(std::abs(width[left]-width[right])>2*tolerance+.15*span)continue;
+      const auto l=transverse(rim[left]-rows[left].foot),r=transverse(rim[right]-rows[right].foot);
+      if(l.normalized().dot(r.normalized())<.95 ||
+         std::abs(rows[left].footNormal.dot(rows[right].footNormal))<.9)continue;
+      bool supported=true;double deepest=0;
+      std::vector<Eigen::Vector3d> targets;
+      for(auto i=left+1;i<right;++i) {
+        const double t=(station(i)-station(left))/span;
+        const Eigen::Vector3d delta=(1-t)*(rim[left]-rows[left].foot)+t*(rim[right]-rows[right].foot);
+        const Eigen::Vector2d d=transverse(delta);
+        const double expected=d.norm(),missing=expected-width[i];
+        if(!rows[i].hasFoot || missing<-tolerance || missing>depthLimit ||
+           std::abs(rows[i].footNormal.dot(rows[left].footNormal))<.9) {supported=false;break;}
+        // Compare tracked normals with each other above, not with original
+        // XYZ vectors: original-frame normals may use the detector's profile
+        // projection. Rims and feet here are in the original coordinate frame.
+        // Sparse/outlying interior measurements remain in the RMS checks.
+        if(expected<=2*tolerance) {supported=false;break;}
+        deepest=std::max(deepest,missing);
+        targets.push_back(rows[i].foot+delta);
+      }
+      if(!supported || deepest<=2*tolerance)continue;
+      for(auto i=left+1;i<right;++i) {
+        const auto &target=targets[i-left-1];
+        const double length=transverse(target-rows[i].foot).norm();
+        if(length>best[i]+.25*tolerance) {
+          best[i]=length;rows[i].hasRim=true;rows[i].rim=target;
+        }
+      }
+    }
+  }
 }
 bool fitRun(std::vector<Row> &rows,const std::vector<SurfaceSection> &sections,
             const DetectorConfig &config,BSplineSurfacePatch &out,int minimumControlsU=4) {
@@ -164,6 +249,17 @@ bool fitRun(std::vector<Row> &rows,const std::vector<SurfaceSection> &sections,
             row.contourLength+=delta.norm();
             if(row.footAtStart)for(auto &arc:row.arc)arc+=delta.norm();
           }
+        }
+      }
+      if(row.hasRim) {
+        const double t=projection(row.rim),first=projection(row.points.front()),last=projection(row.points.back());
+        row.rimAtStart=t<first;
+        if((t>=first && t<=last) || (row.hasFoot && row.rimAtStart==row.footAtStart))row.hasRim=false;
+        else {
+          const auto &edge=row.rimAtStart?row.points.front():row.points.back();
+          const double length=std::hypot(row.rim[b]-edge[b],row.rim[c]-edge[c]);
+          row.contourLength+=length;
+          if(row.rimAtStart)for(auto &arc:row.arc)arc+=length;
         }
       }
       for(auto &t:row.arc)t/=row.contourLength;
@@ -370,6 +466,7 @@ BSplineSurfaceModel fitSurfaceModel(const CloudT &source,
   };
   auto flush=[&] {
     if(rows.empty())return;
+    if(face==1 || face==2)repairRims(rows,sections,config);
     fitPart(std::move(rows));
     rows.clear();
   };
