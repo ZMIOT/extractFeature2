@@ -368,7 +368,7 @@ struct DetectorConfig {
   // Walk outward from the central reference span and stop at sustained bends/jumps.
   /** @brief 截去两端持续不稳定的轨迹。 @details 默认 true；有效范围 true/false。 */
   bool trimUnstableEndpoints = true;
-  // Stop each side face at its own trajectory end; close the floor between ends.
+  // Stop each side face at its own trajectory end; floor support is independent.
   bool limitSurfaceEndsToTracks = true;
   /** @brief 端点截断检查窗口（长度）。 @details 默认 12.0f；有效范围 0.000001..1000000000。 */
   float endpointTrimWindow = 12.0f;

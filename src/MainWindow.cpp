@@ -370,9 +370,9 @@ void MainWindow::buildUi() {
   trimEndpoints_ = new QCheckBox(QStringLiteral("首尾大幅变动处截断"),parameters_);
   trimEndpoints_->setObjectName("trimUnstableEndpoints");
   trimEndpoints_->setToolTip(QStringLiteral("疑似尾段先检查实测侧壁脚，修正误跟踪到底面纹路的候选，再从稳定段检查方向变化和偏离量；连续异常达到确认长度时停止。左右分别判断。"));
-  limitSurfaceEnds_ = new QCheckBox(QStringLiteral("面随左右轨迹各自终点停止"),parameters_);
+  limitSurfaceEnds_ = new QCheckBox(QStringLiteral("侧壁面随各自轨迹终点停止"),parameters_);
   limitSurfaceEnds_->setObjectName("limitSurfaceEndsToTracks");
-  limitSurfaceEnds_->setToolTip(QStringLiteral("左右侧壁分别停在各自轨迹终点，底面限制在两侧壁共同覆盖的范围内。取消后可提取轨迹终点之外仍有实测支持的面。"));
+  limitSurfaceEnds_->setToolTip(QStringLiteral("左右侧壁分别停在各自轨迹终点；底面独立按实测支撑保留，不随较短侧壁截断。取消后侧壁也可保留轨迹终点之外仍有实测支持的部分。"));
   connect(limitSurfaceEnds_,&QCheckBox::toggled,this,[this] { invalidateResult(); });
   inputVoxel_ = spin(0, 1000000000, .001, QStringLiteral("直接输入降采样 size，支持最多六位小数，0 关闭。主体分析使用采样点，面提取恢复主体范围内的原始密集点。有原始帧时，轨迹也恢复原始轮廓，帧几何不随采样改变；无帧号时轨迹检测使用采样点。较大的 size 仍可能改变主体范围。"));
   inputVoxel_->setObjectName("inputVoxelSize");

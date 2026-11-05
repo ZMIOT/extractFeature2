@@ -53,7 +53,7 @@ int main(int argc, char **argv) {
         << "  --uniform-width arc|chord  Trim each width tail by 10%, then place a uniform pair along the bottom\n"
         << "  --no-uniform-width-filter  --uniform-width-filter-length 12\n"
         << "  --no-endpoint-trim  --endpoint-window 12  --endpoint-angle 20  --endpoint-deviation 1.5\n"
-        << "  --independent-surface-ends (retain measured faces beyond trajectory ends)\n"
+        << "  --independent-surface-ends (retain measured walls beyond trajectory ends; floor is always independent)\n"
         << "  --final-smoothing-length 12  --final-robust-scale 0.6\n"
         << "  --profile-curvature-radius 8  --no-profile-curvature\n"
         << "  --localization curve-line|curvature (default curvature)\n"

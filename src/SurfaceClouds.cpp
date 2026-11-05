@@ -111,6 +111,62 @@ SidePlane fitToePatch(const CloudT &profile, const std::vector<bool> &supported,
   return plane;
 }
 
+// Recover a curved lower wall only when this section has a measured chain
+// connecting its accepted foot to already classified wall points. A broad
+// wall plane need not fit that short transition. Never output interpolated
+// points, cross a measurement gap, or grow beyond the first wall contact.
+void recoverMeasuredToeStrip(const CloudT &profile,const std::vector<bool> &supported,
+    const std::vector<Eigen::Vector2f> &normals,const std::vector<std::size_t> &indices,
+    const Eigen::Vector2f &toe,Eigen::Vector2f normal,const Eigen::Vector2f &up,
+    const Eigen::Vector2f &outward,float radius,float tolerance,float reach,float minimumSlope,
+    unsigned char face,const std::vector<unsigned char> &labels,std::vector<std::size_t> &recovered) {
+  if(!normal.allFinite() || normal.squaredNorm()<.5f)return;
+  normal.normalize();
+  Eigen::Vector2f tangent(-normal.y(),normal.x());
+  if(tangent.dot(up)<0)tangent=-tangent;
+  if(tangent.dot(up)<minimumSlope)return;
+  const float binSize=std::max(.1f,.5f*radius);
+  std::map<int,std::vector<std::size_t>> bins;
+  for(std::size_t j=0;j<indices.size();++j) {
+    const auto label=labels[indices[j]];
+    // The broad planes may provisionally call the curved lower wall floor.
+    // Only reclaim such points outside this measured foot: the final floor
+    // corridor would discard them anyway. Never take interior floor points.
+    const bool outsideFoot=face==1?profile[j].x<=toe.x():profile[j].x>=toe.x();
+    if(!supported[j] || (label && label!=face && !(label==3 && outsideFoot)))continue;
+    const Eigen::Vector2f delta=Eigen::Vector2f(profile[j].x,profile[j].y)-toe;
+    const float along=tangent.dot(delta);
+    if(along<=0 || along>reach || up.dot(delta)<=0 || outward.dot(delta)<-tolerance)continue;
+    if(std::abs(normals[j].dot(normal))<.5f || std::abs(normals[j].dot(outward))<minimumSlope)continue;
+    bins[int(std::floor(along/binSize))].push_back(j);
+  }
+  float lastAlong=0,lastAcross=0;
+  std::vector<std::size_t> connected;
+  for(const auto &bin:bins) {
+    const float along=(bin.first+.5f)*binSize;
+    if(along-lastAlong>2*radius)break;
+    std::vector<float> across;
+    for(auto j:bin.second) {
+      const float x=normal.dot(Eigen::Vector2f(profile[j].x,profile[j].y)-toe);
+      if(std::abs(x-lastAcross)<=2*tolerance)across.push_back(x);
+    }
+    if(across.empty())continue;
+    const float center=median(across);
+    bool contact=false;
+    for(auto j:bin.second) {
+      const float x=normal.dot(Eigen::Vector2f(profile[j].x,profile[j].y)-toe);
+      if(std::abs(x-center)>tolerance || std::abs(x-lastAcross)>2*tolerance)continue;
+      contact=contact || labels[indices[j]]==face;
+      connected.push_back(indices[j]);
+    }
+    if(contact) {
+      recovered.insert(recovered.end(),connected.begin(),connected.end());
+      return;
+    }
+    lastAlong=along;lastAcross=center;
+  }
+}
+
 // Follow the measured floor inward from a supported wall foot when the other
 // trajectory is absent. Each bin must connect to the preceding measured band;
 // neither a nominal groove width nor a neighboring frame supplies its extent.
@@ -283,8 +339,11 @@ void extractSurfaceClouds(const CloudT::ConstPtr &source,
     }
   }
   std::vector<unsigned char> labels(source->size(), 0);
+  std::array<std::vector<std::size_t>,2> toeRecoveries;
   std::vector<std::array<float,2>> floorBounds(sections.size(),
       {{-std::numeric_limits<float>::infinity(),std::numeric_limits<float>::infinity()}});
+  std::vector<bool> trackedFloorSupport(sections.size(),false);
+  std::vector<bool> openFloorSupport(sections.size(),false);
   detail::GpuSurfaceNormals gpuNormalBatch;
   const bool gpuNormals=detail::computeSurfaceNormalsGpu(
       *source,groups,u,v,radius,gpuNormalBatch);
@@ -418,18 +477,35 @@ void extractSurfaceClouds(const CloudT::ConstPtr &source,
     }
     if(!section.leftValid)planes[0].valid=false;
     if(!section.rightValid)planes[1].valid=false;
-    // A two-wall floor ends at the measured feet, even when the infinite
-    // fitted wall planes would also admit an exterior sheet or shoulder.
-    if(planes[0].valid)floorBounds[s][0]=left.x();
-    if(planes[1].valid)floorBounds[s][1]=right.x();
     const bool recoveredSection=section.leftBoundaryUncertain || section.rightBoundaryUncertain;
     const bool singleSide=recoveredSection ? planes[0].valid!=planes[1].valid : section.leftValid!=section.rightValid;
+    // Both measured trajectory feet still bound the floor when a very short
+    // side contains too few points for a reliable face fit. At least one side
+    // plane is required so a caller-supplied pair on a flat sheet cannot invent
+    // a groove. Rejected/uncertain boundaries use the measured-wall recovery
+    // path above instead of trusting the rejected trajectory point.
+    const bool trackedFloor= !recoveredSection && section.leftValid && section.rightValid &&
+                             (planes[0].valid || planes[1].valid);
+    trackedFloorSupport[s]=trackedFloor;
+    // A two-wall floor ends at its measured feet, even when the infinite
+    // fitted wall planes would also admit an exterior sheet or shoulder.
+    if(planes[0].valid || trackedFloor)floorBounds[s][0]=left.x();
+    if(planes[1].valid || trackedFloor)floorBounds[s][1]=right.x();
     const int presentSide=recoveredSection? (planes[0].valid?0:1) : (section.leftValid?0:1);
     const auto &floorToe=presentSide==0?left:right;
     const int inward=presentSide==0?1:-1;
-    const auto openFloor=(singleSide || recoveredSection) && planes[presentSide].valid
+    const auto &trackedNormal=presentSide==0?section.leftNormal:section.rightNormal;
+    // The detector can retain a supported wall-foot trajectory even when its
+    // single-frame wall patch is too sparse to fit (e.g. a short shallow end).
+    // Its accepted normal seeds only measured inward floor growth; it never
+    // creates a wall plane. Uncertain/rejected trajectories cannot seed this.
+    const bool trackedFoot=singleSide && !recoveredSection &&
+        trackedNormal.allFinite() && trackedNormal.squaredNorm()>.5f;
+    const auto openFloor=(singleSide || recoveredSection) && (planes[presentSide].valid || trackedFoot)
         ? traceOpenFloor(*profile,supported,normals,floorToe,inward,binSize,radius,tolerance)
         : std::map<int,float>{};
+    openFloorSupport[s]=singleSide && !recoveredSection && !openFloor.empty();
+    if(openFloorSupport[s])floorBounds[s][presentSide]=floorToe.x();
     const bool shortSection=planes[0].toePatch || planes[1].toePatch;
     auto inside=[&](const Eigen::Vector2f &p) {
       if(singleSide || recoveredSection) {
@@ -439,12 +515,16 @@ void extractSurfaceClouds(const CloudT::ConstPtr &source,
         const auto bin=openFloor.find(int(std::floor(distance/binSize)));
         return bin!=openFloor.end() && std::abs(p.y()-bin->second)<=2*tolerance;
       }
-      if(!planes[0].valid || !planes[1].valid)return false;
-      if(shortSection) {
+      // A sparse side is allowed to disappear from the side-face output
+      // without erasing the supported bottom between the two measured feet.
+      // Use the same bounded local corridor as a short transition; never
+      // extend either missing wall plane or generate side points.
+      if(trackedFloor && (shortSection || !planes[0].valid || !planes[1].valid)) {
         const float along=floorDirection.dot(p-left);
         return along>0 && along<(right-left).norm() &&
                std::abs(up.dot(p-left))<=2*shortRadius;
       }
+      if(!planes[0].valid || !planes[1].valid)return false;
       return planes[0].normal.dot(p)-planes[0].offset>tolerance &&
              planes[1].normal.dot(p)-planes[1].offset<-tolerance;
     };
@@ -490,6 +570,14 @@ void extractSurfaceClouds(const CloudT::ConstPtr &source,
           labels[indices[j]]=3;
       }
     }
+    if(knownOpening)for(int side=0;side<2;++side) {
+      if(!planes[side].valid || (side?section.rightBoundaryUncertain:section.leftBoundaryUncertain))continue;
+      recoverMeasuredToeStrip(*profile,supported,normals,indices,side?right:left,
+          side?section.rightNormal:section.leftNormal,up,
+          side?floorDirection:Eigen::Vector2f(-floorDirection),radius,tolerance,
+          std::max(4*radius,config.profileCurvatureRadius),minimumSlope,
+          side?2:1,labels,toeRecoveries[side]);
+    }
   }
   // Recover raw measurements rejected only by unstable local normals. Use
   // fixed, same-section face seeds and interpolate within their contour span;
@@ -529,29 +617,11 @@ void extractSurfaceClouds(const CloudT::ConstPtr &source,
       if((p-expected).norm()<=std::min(tolerance,.25f*radius))labels[index]=face;
     }
   }
-  // Use detector stations, not raw X or frame-vector offsets: original scans
-  // may be tilted or reversed. Each wall keeps its own end; a two-wall floor
-  // stops at their common end instead of projecting past the shorter wall.
-  if(config.limitSurfaceEndsToTracks && ends) {
-    const auto &left=(*ends)[0], &right=(*ends)[1];
-    for(std::size_t s=0;s<groups.size();++s)for(auto index:groups[s]) {
-      const auto label=labels[index];
-      bool limited=false;
-      float stop=0;
-      if(label==1 && left.valid) {stop=left.station;limited=true;}
-      if(label==2 && right.valid) {stop=right.station;limited=true;}
-      if(label==3 && (left.valid || right.valid)) {
-        limited=true;
-        stop=left.valid?left.station:right.station;
-        if(left.valid && right.valid)stop=std::min(left.station,right.station);
-      }
-      if(limited && sections[s].station>stop+1.e-4f)labels[index]=0;
-    }
-  }
-  // On a two-wall workpiece, the floor only exists over the common measured
-  // wall span. Apply this after recovery and endpoint clipping: otherwise a
-  // single-side floor trace can leave a tongue beyond either wall at either
-  // end. An actual single-wall scan keeps its connected measured floor.
+  // Inside the two-wall span, a temporarily missing wall must not let the
+  // bottom grow into an exterior sheet. At an emerging/disappearing end,
+  // however, one trajectory can legitimately start later than the other.
+  // Keep its independently traced measured floor instead of requiring the
+  // missing wall to have a trajectory or a fitted surface first.
   std::array<std::size_t,2> first{{groups.size(),groups.size()}},last{{0,0}};
   for(std::size_t s=0;s<groups.size();++s)for(auto index:groups[s]) {
     const auto label=labels[index];
@@ -580,9 +650,26 @@ void extractSurfaceClouds(const CloudT::ConstPtr &source,
   }
   for(std::size_t s=0;s<groups.size();++s)for(auto index:groups[s])if(labels[index]==3) {
     const float across=(*source)[index].data[u];
-    if((twoWalls && (s<floorBegin || s>floorEnd ||
+    const bool openEnd=openFloorSupport[s] && (s<floorBegin || s>floorEnd);
+    if((twoWalls && !trackedFloorSupport[s] && !openEnd && (s<floorBegin || s>floorEnd ||
          !std::isfinite(floorBounds[s][0]) || !std::isfinite(floorBounds[s][1]))) ||
         across<=floorBounds[s][0] || across>=floorBounds[s][1])labels[index]=0;
+  }
+  // Apply toe strips after the fixed-seed contour recovery and floor bounds:
+  // new toe points must not rotate its PCA direction or seed further growth.
+  for(int side=0;side<2;++side)for(auto index:toeRecoveries[side])
+    if(!labels[index])labels[index]=side?2:1;
+  // Clip only the exported walls, after measured floor support has been
+  // resolved. Clipping wall labels earlier would also shorten the floor's
+  // support span above. The floor keeps its measured bounds independently.
+  // Use detector stations, not raw X: scans may be tilted or reversed.
+  if(config.limitSurfaceEndsToTracks && ends) {
+    for(std::size_t s=0;s<groups.size();++s)for(auto index:groups[s]) {
+      const auto label=labels[index];
+      if(label!=1 && label!=2)continue;
+      const auto &end=(*ends)[label-1];
+      if(end.valid && sections[s].station>end.station+1.e-4f)labels[index]=0;
+    }
   }
   // Preserve original order and exact XYZ, including legitimate repeated
   // samples. Distinct output clouds never share a source index.

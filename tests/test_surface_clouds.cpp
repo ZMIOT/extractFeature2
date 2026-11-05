@@ -100,13 +100,16 @@ void geometryTest(weld::Axis axis, int opening, int wallShape, bool framed, bool
       for(const auto &p:*before) {
         const float station=framed?-(p.data[a]-.15f*p.data[u]):p.data[a];
         const float stop=side==1?18:8;
-        if(station<=stop+1.e-4f)expected.insert(key(p));
+        if(side==2 || station<=stop+1.e-4f)expected.insert(key(p));
       }
       require(after->size()==expected.size(),"Independent surface endpoints lost valid coverage");
       for(const auto &p:*after)require(expected.count(key(p))!=0,"Surface exceeded its independent endpoint");
-      require(after->size()<before->size(),"Endpoint limit did not remove the tail");
+      if(side<2)require(after->size()<before->size(),"Endpoint limit did not remove the wall tail");
+      else require(after->size()==before->size(),"Wall endpoint limit removed measured floor");
     }
-    require(limited.weldSurfaceModel.valid(),"Limited floor model was not fitted");
+    require(limited.weldSurfaceModel.valid(),"Independent floor model was not fitted");
+    require(limited.weldSurfaceModel.patches.back().lastFrame==result.weldSurfaceModel.patches.back().lastFrame,
+            "Wall endpoint limit shortened floor model coverage");
     config.limitSurfaceEndsToTracks=false;
     weld::SeamResult restored;
     weld::extractSurfaceClouds(input,sections,config,restored,framed?&frames:nullptr,false,&ends);
@@ -269,6 +272,48 @@ void shortTransitionTest(weld::Axis axis,int opening) {
           "Flat floor was invented into three surfaces");
 }
 
+void sparseSideKeepsFloorTest(weld::Axis axis,int opening,int sparseSide) {
+  weld::DetectorConfig config;
+  config.longitudinalAxis=axis;config.interiorOpeningDirection=opening;
+  const int a=int(axis),u=a==0?1:0,v=a==2?1:2;
+  auto point=[&](float station,float width,float height) {
+    weld::PointT p;p.data[a]=station;p.data[u]=width;p.data[v]=opening*height;return p;
+  };
+  weld::CloudT::Ptr input(new weld::CloudT);
+  std::vector<weld::SurfaceSection> sections;
+  for(int f=0;f<8;++f) {
+    const float station=2.f*f;
+    weld::SurfaceSection section;section.station=station;
+    section.left=point(station,-8,0);section.right=point(station,8,0);
+    section.leftNormal=section.rightNormal=Eigen::Vector2f(1,0);
+    sections.push_back(section);
+    for(int j=-80;j<=80;++j)input->push_back(point(station,.1f*j,0));
+    for(int side=0;side<2;++side) {
+      // The first three sections model the shallow end in the screenshot: a
+      // tracked foot exists, but one side has too few measurements to fit.
+      // Later sections make both walls valid, exercising the common-span trim.
+      const int samples=side==sparseSide && f<3?3:150;
+      for(int j=1;j<=samples;++j)
+        input->push_back(point(station,side?8:-8,.1f*j));
+    }
+  }
+  weld::SeamResult result;
+  weld::extractSurfaceClouds(input,sections,config,result);
+  const auto sparse=sparseSide?result.rightSurface:result.leftSurface;
+  const auto supported=sparseSide?result.leftSurface:result.rightSurface;
+  for(const auto &p:*sparse)
+    require(p.data[a]>=6,"Sparse endpoint side was fabricated into a fitted wall");
+  require(supported->size()>800,"Supported side wall disappeared");
+  require(result.weldSurface->size()>1200,"Sparse side erased the measured bottom");
+  int sparseEndFloor=0;
+  for(const auto &p:*result.weldSurface)
+    if(p.data[a]<6)++sparseEndFloor;
+  require(sparseEndFloor>400,"Common wall span trimmed the sparse-end bottom");
+  for(const auto &p:*result.weldSurface)
+    require(std::abs(p.data[u])<8.001f && std::abs(p.data[v])<1.e-4f,
+            "Sparse-side bottom escaped its measured feet or included a wall");
+}
+
 void singleWallFloorTest(weld::Axis axis,int opening,int side) {
   weld::DetectorConfig config;
   config.longitudinalAxis=axis;config.interiorOpeningDirection=opening;
@@ -291,7 +336,9 @@ void singleWallFloorTest(weld::Axis axis,int opening,int side) {
       input->push_back(point(float(f),distance,8+.001f*distance*distance));
       input->push_back(point(float(f),distance+40,0));
     }
-    for(int j=1;j<=150;++j) {
+    // At the first section the accepted tracked foot remains, but the wall
+    // itself has no fit support. The measured bottom must still be retained.
+    for(int j=1;f!=0 && j<=150;++j) {
       const float height=.1f*j;
       input->push_back(point(float(f),-.5f*height,height));
       input->push_back(point(float(f),-8-.1f*j,15)); // outer shoulder
@@ -311,6 +358,8 @@ void singleWallFloorTest(weld::Axis axis,int opening,int side) {
   require(!(side==0?result.leftSurface:result.rightSurface)->empty(),"Single wall surface disappeared");
   require(result.weldSurface->size()>2600,"Single wall lost its connected measured floor");
   require(result.weldSurfaceModel.valid(),"Single wall floor model was not fitted");
+  require(result.weldSurfaceModel.patches.front().firstFrame==100,
+          "Sparse tracked wall foot lost the first measured floor section");
   std::set<Key> measured,used;
   for(const auto &p:*input)measured.insert(key(p));
   for(const auto &cloud:{result.leftSurface,result.rightSurface,result.weldSurface})
@@ -322,6 +371,17 @@ void singleWallFloorTest(weld::Axis axis,int opening,int side) {
     const float distance=inward*p.data[u],height=opening*p.data[v];
     require(distance>0 && distance<=30.001f && height<1,"Single wall floor crossed a gap, wall or detached sheet");
   }
+  std::array<weld::SurfaceEnd,2> ends;
+  ends[side].valid=true;ends[side].station=4;
+  weld::SeamResult limited;
+  weld::extractSurfaceClouds(input,sections,config,limited,&frames,true,&ends);
+  require(limited.weldSurface->size()==result.weldSurface->size(),"Single wall endpoint clipped measured floor");
+  for(std::size_t i=0;i<result.weldSurface->size();++i)
+    require(key((*limited.weldSurface)[i])==key((*result.weldSurface)[i]),"Single wall endpoint changed floor support");
+  for(const auto &p:*(side==0?limited.leftSurface:limited.rightSurface))
+    require(p.data[a]-.1f*inward*p.data[u]<=4+1.e-4f,"Single wall ignored its trajectory endpoint");
+  require(limited.weldSurfaceModel.valid() && limited.weldSurfaceModel.patches.back().lastFrame==111,
+          "Single wall endpoint clipped floor model");
   for(auto &section:sections)section.leftValid=section.rightValid=false;
   weld::extractSurfaceClouds(input,sections,config,result,&frames,false);
   require(result.weldSurface->empty(),"Unsupported section generated a floor");
@@ -358,19 +418,65 @@ void boundedTwoWallFloorTest(weld::Axis axis,bool framed) {
   require(result.weldSurface->size()>1500,"Two-wall bound discarded supported interior floor");
   for(const auto &p:*result.weldSurface) {
     const float station=framed?-p.data[a]+.15f*p.data[u]:p.data[a];
-    require(station>=6-1.e-4f && station<=28+1.e-4f,"Floor protrudes past a measured wall start/end");
-    require(p.data[u]>-8 && p.data[u]<8,"Floor crossed a measured wall foot");
+    require(station>=-1.e-4f && station<=34+1.e-4f,"Floor protrudes past all measured wall support");
+    require(p.data[u]>=-8 && p.data[u]<=8,"Floor crossed the measured floor edge");
+    if(station>=6-1.e-4f && station<=28+1.e-4f)
+      require(p.data[u]>-8 && p.data[u]<8,"Interior floor crossed a measured wall foot");
   }
   require(result.weldSurfaceModel.valid(),"Bounded floor model is missing");
+  require(result.weldSurfaceModel.patches.front().firstStation==0 &&
+          result.weldSurfaceModel.patches.back().lastStation==34,
+          "One missing endpoint trajectory clipped the connected floor model");
   for(const auto &patch:result.weldSurfaceModel.patches) {
-    require(patch.firstStation>=6 && patch.lastStation<=28,"Floor model extrapolated its measured support");
+    require(patch.firstStation>=0 && patch.lastStation<=34,"Floor model extrapolated its measured support");
     for(int i=0;i<=40;++i)for(int j=0;j<=20;++j) {
       Eigen::Vector3d p,n;require(patch.evaluate(i/40.,j/20.,p,&n),"Bounded floor has a singular fit");
       const double station=framed?-p[a]+.15*p[u]:p[a];
-      require(station>=6-1.e-3 && station<=28+1.e-3 && p[u]>=-8 && p[u]<=8,
+      // The open measured edge and plane-clipped interior have slightly
+      // different widths. A spline can overshoot by its fitting tolerance;
+      // exact corridor membership is checked on the measured points above.
+      const float fitTolerance=2*std::max(config.hullSurfaceDistance,config.profileWallTolerance);
+      require(station>=-1.e-3 && station<=34+1.e-3 && p[u]>=-8-fitTolerance && p[u]<=8+fitTolerance,
               "Fitted bottom protrudes beyond the two-wall corridor");
     }
   }
+}
+
+void curvedToeStripTest(weld::Axis axis,int opening,int side,bool gap) {
+  weld::DetectorConfig config;config.longitudinalAxis=axis;config.interiorOpeningDirection=opening;
+  config.sliceStep=2;
+  const int a=int(axis),u=a==0?1:0,v=a==2?1:2;
+  const float sign=side?1.f:-1.f;
+  auto point=[&](float station,float across,float height) {
+    weld::PointT p;p.data[a]=station;p.data[u]=across;p.data[v]=opening*height;return p;
+  };
+  weld::CloudT::Ptr input(new weld::CloudT);
+  std::vector<weld::SurfaceSection> sections;
+  for(int f=0;f<8;++f) {
+    const float station=2.f*f;
+    weld::SurfaceSection s;s.station=station;s.left=point(station,-8,0);s.right=point(station,8,0);
+    s.leftNormal=s.rightNormal=Eigen::Vector2f(1,0);sections.push_back(s);
+    for(int j=-80;j<=80;++j)input->push_back(point(station,.1f*j,0));
+    for(int j=1;j<=150;++j) {
+      const float h=.1f*j,x=8+2.5f*(1-std::exp(-h/3));
+      if(!gap || h<1 || h>3)input->push_back(point(station,sign*x,h));
+      input->push_back(point(station,-sign*8,h));
+      input->push_back(point(station,sign*(x+15),h)); // disconnected parallel wall
+    }
+  }
+  weld::SeamResult result;
+  weld::extractSurfaceClouds(input,sections,config,result);
+  checkMeasured(*input,result);
+  int nearToe=0;
+  for(const auto &p:*(side?result.rightSurface:result.leftSurface)) {
+    const float h=opening*p.data[v];
+    require(std::abs(p.data[u])<12,"Curved toe recovery reached a detached wall");
+    require(h>0,"Curved toe recovery stole flat floor");
+    if(h<1)++nearToe;
+    if(gap)require(h<1 || h>3,"Curved toe recovery invented missing measurements");
+  }
+  if(gap)require(nearToe==0,"Curved toe recovery crossed an unsupported gap to the wall");
+  else require(nearToe>20,"Curved measured wall foot was rejected by the broad plane");
 }
 
 void measuredFootContinuationTest() {
@@ -473,7 +579,12 @@ void endpointSurfaceTest() {
     for(const auto &p:*(side?limited.rightSurface:limited.leftSurface))
       require(p.x<=after.back().x+1.e-4f,"Side surface exceeded its trajectory end");
   }
-  require(limited.weldSurface->size()<trimmed.weldSurface->size(),"Floor did not stop with trajectories");
+  require(limited.weldSurface->size()==trimmed.weldSurface->size(),"Wall endpoint limits discarded measured floor");
+  for(std::size_t i=0;i<trimmed.weldSurface->size();++i)
+    require(key((*limited.weldSurface)[i])==key((*trimmed.weldSurface)[i]),"Wall endpoint limits changed floor points");
+  require(limited.weldSurfaceModel.valid() &&
+          limited.weldSurfaceModel.patches.back().lastFrame==trimmed.weldSurfaceModel.patches.back().lastFrame,
+          "Wall endpoint limits shortened recovered floor model");
   std::cout<<"Endpoint trim retains measured surfaces and models; trajectory cuts and frame gaps preserved.\n";
 }
 
@@ -531,7 +642,9 @@ int main(int argc,char **argv) {
     if(argc==2 && std::string(argv[1])=="--endpoint-surfaces") {
       measuredFootContinuationTest();
       for(auto axis:{weld::Axis::X,weld::Axis::Y,weld::Axis::Z})
-        for(bool framed:{false,true})geometryTest(axis,1,0,framed,true);
+        for(int opening:{-1,1})for(int side:{0,1})for(bool gap:{false,true})curvedToeStripTest(axis,opening,side,gap);
+      for(auto axis:{weld::Axis::X,weld::Axis::Y,weld::Axis::Z})
+        for(int opening:{-1,1})for(bool framed:{false,true})geometryTest(axis,opening,0,framed,true);
       rejectedBoundaryTest();
       endpointSurfaceTest();
       return 0;
@@ -585,6 +698,7 @@ int main(int argc,char **argv) {
     for(auto axis:{weld::Axis::X,weld::Axis::Y,weld::Axis::Z})
       for(int opening:{-1,1}) {
         shortTransitionTest(axis,opening);
+        for(int side:{0,1})sparseSideKeepsFloorTest(axis,opening,side);
         for(int side:{0,1})singleWallFloorTest(axis,opening,side);
       }
     std::cout<<"Three measured surfaces: geometry, coverage, axes, reversed tilted frames, gaps and defaults passed.\n";
